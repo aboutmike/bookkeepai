@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ── Dependencies ──────────────────────────────────────
 node_modules/
 functions/node_modules/
@@ -22,16 +23,46 @@ ui-debug.log
 extension/*.crx
 
 # ── OS files ──────────────────────────────────────────
+=======
+# OS files
+>>>>>>> 69390ca81f52d93bfdf22028d9975e52525e45e0
 .DS_Store
 Thumbs.db
 desktop.ini
 
+<<<<<<< HEAD
 # ── Editor ────────────────────────────────────────────
+=======
+# Editor directories
+>>>>>>> 69390ca81f52d93bfdf22028d9975e52525e45e0
 .vscode/
 .idea/
 *.swp
 *.swo
 
+<<<<<<< HEAD
 # ── Build output ──────────────────────────────────────
 dist/
 build/
+=======
+# Node (if ever used for build tooling)
+node_modules/
+npm-debug.log*
+
+# Build output
+dist/
+build/
+
+# Local dev notes
+*.local
+TODO.local.md
+
+# Chrome extension pack output
+*.crx
+*.pem
+
+# Sensitive — never commit real keys
+.env
+.env.local
+secrets.json
+>>>>>>> 69390ca81f52d93bfdf22028d9975e52525e45e0

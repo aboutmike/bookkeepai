@@ -86,17 +86,11 @@ const Store=(()=>{
   async function getAll(){return(await re('bk_exp'))||[];}
   async function add(d){
     const list=await getAll();
-    // If an id is provided (e.g. from Firestore sync), use it to prevent duplicates
-    // Only generate a new uid if no id exists
-    const e={id:d.id||uid(),createdAt:d.createdAt||new Date().toISOString(),
+    const e={id:uid(),createdAt:new Date().toISOString(),
       date:d.date||new Date().toISOString().split('T')[0],vendor:d.vendor||'Unknown',
       amount:parseFloat(d.amount)||0,tax:parseFloat(d.tax)||0,
       category:d.category||'Other Deductible Expense',notes:d.notes||'',source:d.source||'chat'};
-    // Guard: if this id already exists locally, update it instead of duplicating
-    const existingIdx=list.findIndex(x=>x.id===e.id);
-    if(existingIdx>=0){list[existingIdx]={...list[existingIdx],...e};}
-    else{list.push(e);}
-    await we('bk_exp',list);return e;
+    list.push(e);await we('bk_exp',list);return e;
   }
   async function del(id){await we('bk_exp',(await getAll()).filter(e=>e.id!==id));}
   async function renameCategory(oldName,newName){
@@ -154,24 +148,7 @@ const Gemini=(()=>{
   function sysprompt(cats){
     const region=S.cfg?.region||'US';
     const label=region==='US'?'United States (IRS rules)':'Canada (CRA rules)';
-    const fence='```';
-    return 'You are BookkeepAI, a bookkeeping assistant for a small business in '+label+'.\n\n'
-      +'SCOPE: Only respond to expense logging, tax categorization, and financial queries. '
-      +'Politely decline everything else with a one-line message.\n\n'
-      +'ANSWERING FINANCIAL QUERIES:\n'
-      +'- Every user message includes a [DATA CONTEXT] block containing ALL their recorded expenses as JSON.\n'
-      +'- You MUST use this data to answer any question about spending, totals, or expenses.\n'
-      +'- NEVER say you lack access to transaction history. The full expense list is in every message.\n'
-      +'- Filter the expenses array by date yourself for queries like "last month" or "this year".\n'
-      +'- Format currency clearly and cite exact numbers from the data.\n\n'
-      +'LOGGING NEW EXPENSES:\n'
-      +'When logging an expense from text or receipt, output this block then a short confirmation:\n'
-      +fence+'expense_entry\n'
-      +'{"date":"YYYY-MM-DD","vendor":"Name","amount":0.00,"tax":0.00,"category":"Category Name","notes":"","confidence":1.0}\n'
-      +fence+'\n'
-      +'Confidence: 1.0=all fields clear; 0.7-0.99=minor assumption; below 0.7=ask for missing fields instead.\n\n'
-      +'APPROVED CATEGORIES (use ONLY these exact names): '+cats.join(', ')+'.\n\n'
-      +'Be concise, friendly, and always answer using the provided expense data.';
+    return `You are BookkeepAI, a bookkeeping assistant for a small business in ${label}. Only respond to expense logging, tax categorization, and financial data queries. Politely decline everything else.\n\nApproved categories (use ONLY these exact names): ${cats.join(', ')}.\n\nWhen you have complete expense data, output this block then a short friendly confirmation:\n\`\`\`expense_entry\n{"date":"YYYY-MM-DD","vendor":"Name","amount":0.00,"tax":0.00,"category":"Category Name","notes":"","confidence":1.0}\n\`\`\`\n\nConfidence: 1.0=all clear; 0.7-0.99=minor assumption; below 0.7=ask for missing fields instead of JSON. Be concise and friendly.`;
   }
   function ocrprompt(cats){
     return `Analyze this receipt. Return ONLY valid JSON, no markdown:\n{"date":"YYYY-MM-DD or null","vendor":"name or null","amount":number_or_null,"tax":number_or_0,"category":"one of: ${cats.join(', ')}","notes":"brief","confidence":0.0,"low_confidence_fields":[]}`;
@@ -268,7 +245,7 @@ function showTab(viewId){
   document.querySelector(`.tab[data-view="${viewId}"]`)?.classList.add('on');
   $(viewId)?.classList.add('on');
   if(viewId==='exp-view')renderTable();
-  if(viewId==='settings-view'){renderCatManager();renderSyncUI();}
+  if(viewId==='settings-view')renderCatManager();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -356,16 +333,9 @@ async function send(){
         }
       }
     }else{
-      // Always load expenses so the AI can answer any financial query.
-      // A keyword check was unreliable — the AI receives the data on every turn.
-      const all=await Store.getAll();
-      const ctx={
-        count:all.length,
-        totalAmount:all.reduce((s,e)=>s+e.amount,0).toFixed(2),
-        totalTax:all.reduce((s,e)=>s+e.tax,0).toFixed(2),
-        currentDate:new Date().toISOString().split('T')[0],
-        expenses:all.map(e=>({date:e.date,vendor:e.vendor,amount:e.amount,tax:e.tax,category:e.category,notes:e.notes}))
-      };
+      const isQ=/how much|total|spent|spend|last month|this month|this year|show me|summary|breakdown|report|expenses/i.test(text);
+      let ctx=null;
+      if(isQ){const all=await Store.getAll();ctx={count:all.length,total:all.reduce((s,e)=>s+e.amount,0).toFixed(2),date:new Date().toISOString().split('T')[0],expenses:all.map(e=>({date:e.date,vendor:e.vendor,amount:e.amount,tax:e.tax,category:e.category}))};}
       const res=await Gemini.chat(S.cfg.apiKey,text,S.hist.slice(-10),ctx,S.cfg);
       hideTyping();
       const display=res.text.replace(/```expense_entry[\s\S]*?```/g,'').trim();
@@ -534,269 +504,6 @@ async function launch(cfg){
   addMsg('ai',`Hello! I'm BookkeepAI, your ${cfg.region==='US'?'IRS':'CRA'} bookkeeping assistant. 📒<br><br><strong>Here's how I can help:</strong><br>• Type an expense: "Bought office supplies at Staples for $45.99"<br>• Upload a receipt using the 📎 button<br>• Ask about your spending: "How much did I spend last month?"<br><br>What would you like to do?`);
 }
 
-
-// ═══════════════════════════════════════════════════════════════
-//  FIREBASE SYNC ENGINE  (REST API — no external SDK needed)
-//  Uses Firebase Auth REST API + Firestore REST API directly.
-//  All calls are plain fetch() — fully MV3 CSP compliant.
-// ═══════════════════════════════════════════════════════════════
-const Sync = (() => {
-  const PROJECT  = 'bookkeep-ai-c787f';
-  const API_KEY  = 'AIzaSyAE7U06FviTpOVd3j9sjteG8Z7-0NJHM4A';
-  const AUTH_URL = 'https://identitytoolkit.googleapis.com/v1';
-  const FS_URL   = `https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/documents`;
-
-  let _idToken    = null;
-  let _uid        = null;
-  let _email      = null;
-  let _expiry     = 0;      // token expiry timestamp
-  let _refreshToken = null;
-
-  // ── Persist session in chrome.storage.local (unencrypted — tokens only) ──
-  async function saveSession(data) {
-    return new Promise(res => chrome.storage.local.set({ bk_sync_session: data }, res));
-  }
-  async function loadSession() {
-    return new Promise(res => chrome.storage.local.get(['bk_sync_session'], r => res(r.bk_sync_session || null)));
-  }
-  async function clearSession() {
-    return new Promise(res => chrome.storage.local.remove(['bk_sync_session'], res));
-  }
-
-  // ── Token refresh ─────────────────────────────────────────────
-  async function refreshToken() {
-    if (!_refreshToken) return false;
-    try {
-      const res = await fetch(`https://securetoken.googleapis.com/v1/token?key=${API_KEY}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: _refreshToken }),
-      });
-      const d = await res.json();
-      if (!d.id_token) return false;
-      _idToken      = d.id_token;
-      _refreshToken = d.refresh_token;
-      _expiry       = Date.now() + (parseInt(d.expires_in) - 60) * 1000;
-      await saveSession({ idToken: _idToken, refreshToken: _refreshToken, uid: _uid, email: _email, expiry: _expiry });
-      return true;
-    } catch { return false; }
-  }
-
-  async function getToken() {
-    if (_idToken && Date.now() < _expiry) return _idToken;
-    if (_refreshToken && await refreshToken()) return _idToken;
-    return null;
-  }
-
-  // ── Auth helpers ──────────────────────────────────────────────
-  function applyAuthResult(d) {
-    _idToken      = d.idToken;
-    _uid          = d.localId;
-    _email        = d.email;
-    _refreshToken = d.refreshToken;
-    _expiry       = Date.now() + (parseInt(d.expiresIn) - 60) * 1000;
-  }
-
-  // ── Sign in with email/password ───────────────────────────────
-  async function signIn(email, password) {
-    const res = await fetch(`${AUTH_URL}/accounts:signInWithPassword?key=${API_KEY}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    });
-    const d = await res.json();
-    if (d.error) throw new Error(d.error.message.replace(/_/g,' ').toLowerCase());
-    applyAuthResult(d);
-    await saveSession({ idToken: _idToken, refreshToken: _refreshToken, uid: _uid, email: _email, expiry: _expiry });
-    return { uid: _uid, email: _email };
-  }
-
-  // Google Sign-In not supported in extension context (OAuth client restrictions)
-  async function signInGoogle() {
-    throw new Error('Use email/password to connect sync. If you signed up with Google, set a password at bookkeep-ai-c787f.web.app first.');
-  }
-
-  // ── Restore session from storage ──────────────────────────────
-  async function restoreSession() {
-    const s = await loadSession();
-    if (!s) return null;
-    _idToken      = s.idToken;
-    _uid          = s.uid;
-    _email        = s.email;
-    _expiry       = s.expiry || 0;
-    _refreshToken = s.refreshToken;
-    // Try to get a valid token
-    const token = await getToken();
-    if (!token) { await clearSession(); return null; }
-    return { uid: _uid, email: _email };
-  }
-
-  function currentUser() {
-    return _uid ? { uid: _uid, email: _email } : null;
-  }
-
-  async function signOut() {
-    _idToken = null; _uid = null; _email = null;
-    _refreshToken = null; _expiry = 0;
-    await clearSession();
-  }
-
-  function ready() { return !!_uid; }
-
-  // ── Firestore REST helpers ────────────────────────────────────
-  // Convert a plain JS object to Firestore REST document fields
-  function toFields(obj) {
-    const fields = {};
-    for (const [k, v] of Object.entries(obj)) {
-      if (v === null || v === undefined) continue;
-      if (typeof v === 'string')  fields[k] = { stringValue: v };
-      else if (typeof v === 'number') fields[k] = { doubleValue: v };
-      else if (typeof v === 'boolean') fields[k] = { booleanValue: v };
-      else fields[k] = { stringValue: String(v) };
-    }
-    return fields;
-  }
-
-  // Convert Firestore REST document fields back to plain JS object
-  function fromFields(fields) {
-    if (!fields) return {};
-    const obj = {};
-    for (const [k, v] of Object.entries(fields)) {
-      if (v.stringValue  !== undefined) obj[k] = v.stringValue;
-      else if (v.doubleValue  !== undefined) obj[k] = v.doubleValue;
-      else if (v.integerValue !== undefined) obj[k] = parseInt(v.integerValue);
-      else if (v.booleanValue !== undefined) obj[k] = v.booleanValue;
-      else if (v.timestampValue !== undefined) obj[k] = v.timestampValue;
-      else obj[k] = null;
-    }
-    return obj;
-  }
-
-  // ── Push one expense to Firestore ─────────────────────────────
-  async function pushExpense(exp) {
-    const token = await getToken();
-    if (!token) return false;
-    const url = `${FS_URL}/expenses/${_uid}/items/${exp.id}?updateMask.fieldPaths=date&updateMask.fieldPaths=vendor&updateMask.fieldPaths=amount&updateMask.fieldPaths=tax&updateMask.fieldPaths=category&updateMask.fieldPaths=notes&updateMask.fieldPaths=source&updateMask.fieldPaths=syncedFrom`;
-    try {
-      const res = await fetch(`${FS_URL}/expenses/${_uid}/items/${exp.id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ fields: toFields({ ...exp, syncedFrom: 'extension' }) }),
-      });
-      return res.ok;
-    } catch { return false; }
-  }
-
-  // ── Pull all expenses from Firestore ──────────────────────────
-  async function pullExpenses() {
-    const token = await getToken();
-    if (!token) return [];
-    try {
-      const res = await fetch(`${FS_URL}/expenses/${_uid}/items`, {
-        headers: { 'Authorization': `Bearer ${token}` },
-      });
-      if (!res.ok) return [];
-      const d = await res.json();
-      return (d.documents || []).map(doc => {
-        const id = doc.name.split('/').pop();
-        return { id, ...fromFields(doc.fields) };
-      });
-    } catch { return []; }
-  }
-
-  // ── Full bidirectional sync ───────────────────────────────────
-  async function syncAll() {
-    if (!ready()) throw new Error('Not signed in to sync');
-    const local    = await Store.getAll();
-    const cloud    = await pullExpenses();
-
-    // Build ID sets BEFORE any mutations
-    const localIds = new Set(local.map(e => e.id));
-    const cloudIds = new Set(cloud.map(e => e.id));
-
-    let pushed = 0, pulled = 0;
-
-    // Push local expenses that are NOT yet in the cloud
-    for (const e of local) {
-      if (!cloudIds.has(e.id)) {
-        if (await pushExpense(e)) pushed++;
-      }
-    }
-
-    // Pull cloud expenses that are NOT yet local
-    // Store.add() will use the Firestore ID, preventing future duplicates
-    for (const e of cloud) {
-      if (!localIds.has(e.id)) {
-        const date = e.date || new Date().toISOString().split('T')[0];
-        await Store.add({ ...e, date, source: e.source || 'pwa-camera' });
-        pulled++;
-      }
-    }
-
-    return { pushed, pulled };
-  }
-
-  return { ready, currentUser, signIn, signInGoogle, restoreSession, signOut, syncAll };
-})();
-
-// ─── Sync UI ───────────────────────────────────────────────────
-async function renderSyncUI() {
-  const user = Sync.currentUser();
-  if (!$('sync-out')) return;
-  if (user) {
-    $('sync-out').classList.add('hidden');
-    $('sync-in').classList.remove('hidden');
-    $('sync-acct').textContent = user.email || 'Connected';
-  } else {
-    $('sync-out').classList.remove('hidden');
-    $('sync-in').classList.add('hidden');
-    if ($('sync-status')) $('sync-status').textContent = '';
-  }
-}
-
-function wireSyncUI() {
-  $('b-sync-in')?.addEventListener('click', async () => {
-    const email = $('sync-email')?.value.trim();
-    const pw    = $('sync-pw')?.value;
-    const err   = $('sync-err');
-    if (!email || !pw) { err.textContent = 'Enter email and password.'; return; }
-    err.textContent = '';
-    const btn = $('b-sync-in');
-    btn.textContent = '…'; btn.disabled = true;
-    try {
-      await Sync.signIn(email, pw);
-      $('sync-email').value = ''; $('sync-pw').value = '';
-      renderSyncUI();
-      toast('Sync connected ✅','ok');
-      doSync();
-    } catch(e) { err.textContent = e.message; }
-    btn.textContent = 'Sign In'; btn.disabled = false;
-  });
-
-
-  $('sync-pw')?.addEventListener('keydown', e => { if(e.key==='Enter') $('b-sync-in')?.click(); });
-  $('b-sync-now')?.addEventListener('click', doSync);
-  $('b-sync-out')?.addEventListener('click', async () => {
-    await Sync.signOut(); renderSyncUI(); toast('Sync disconnected.','');
-  });
-}
-
-async function doSync() {
-  const status = $('sync-status');
-  if (status) status.textContent = 'Syncing…';
-  try {
-    const { pushed, pulled } = await Sync.syncAll();
-    if (status) status.textContent = `Last sync: just now · ${pushed} pushed · ${pulled} pulled`;
-    if (pulled > 0) { renderTable(); toast(`↓ ${pulled} expense${pulled!==1?'s':''} pulled from mobile`,'ok'); }
-    else if (pushed > 0) toast(`↑ ${pushed} expense${pushed!==1?'s':''} pushed to cloud`,'ok');
-    else toast('Already in sync ✅','ok');
-  } catch(e) {
-    if (status) status.textContent = 'Sync failed: ' + e.message;
-    toast('Sync failed: ' + e.message,'err');
-  }
-}
-
-
 // ═══════════════════════════════════════════════════════════════
 //  WIRE ALL EVENTS
 // ═══════════════════════════════════════════════════════════════
@@ -889,16 +596,6 @@ document.addEventListener('DOMContentLoaded',async()=>{
     try{await Store.changePw(o,n);$('set-pw-old').value='';$('set-pw-new').value='';toast('Password updated ✅','ok');}
     catch(e){toast(e.message,'err');}
   });
-
-  // Sync UI
-  wireSyncUI();
-  // Restore Firebase session if user was previously signed in
-  Sync.restoreSession().then(user => { if(user) renderSyncUI(); });
-
-  // Also render sync UI when settings tab is opened
-  const _origShowTab = showTab;
-  // patch showTab to also render sync when settings opens
-  window._showTabOrig = showTab;
 
   // Init
   try{if(await Store.isReady()){showStep('s-lock');$('inp-lock').focus();}else showStep('s0');}
