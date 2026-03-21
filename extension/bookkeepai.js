@@ -1,0 +1,888 @@
+/**
+ * BookkeepAI v3.1
+ * New: Category Manager in Settings, sortable table, PDF removed from Expenses tab
+ */
+
+// ═══════════════════════════════════════════════════════════════
+//  CRYPTO
+// ═══════════════════════════════════════════════════════════════
+const Crypto = (() => {
+  const enc   = s   => new TextEncoder().encode(s);
+  const dec   = b   => new TextDecoder().decode(b);
+  const toB64 = buf => btoa([...new Uint8Array(buf)].map(b=>String.fromCharCode(b)).join(''));
+  const frB64 = b64 => { const s=atob(b64),a=new Uint8Array(s.length); for(let i=0;i<s.length;i++)a[i]=s.charCodeAt(i); return a.buffer; };
+
+  async function dk(pw,salt){
+    const m=await crypto.subtle.importKey('raw',enc(pw),'PBKDF2',false,['deriveKey']);
+    return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:310000,hash:'SHA-256'},m,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+  }
+  async function hashPw(pw){
+    const salt=crypto.getRandomValues(new Uint8Array(16));
+    const m=await crypto.subtle.importKey('raw',enc(pw),'PBKDF2',false,['deriveBits']);
+    const bits=await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:310000,hash:'SHA-256'},m,256);
+    return `${toB64(salt.buffer)}:${toB64(bits)}`;
+  }
+  async function verifyPw(pw,stored){
+    try{
+      const [sb,hb]=stored.split(':');
+      const salt=new Uint8Array(frB64(sb));
+      const m=await crypto.subtle.importKey('raw',enc(pw),'PBKDF2',false,['deriveBits']);
+      const bits=await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:310000,hash:'SHA-256'},m,256);
+      return toB64(bits)===hb;
+    }catch{return false;}
+  }
+  async function encrypt(data,pw){
+    const salt=crypto.getRandomValues(new Uint8Array(16));
+    const iv=crypto.getRandomValues(new Uint8Array(12));
+    const k=await dk(pw,salt);
+    const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},k,enc(JSON.stringify(data)));
+    return `${toB64(salt.buffer)}:${toB64(iv.buffer)}:${toB64(ct)}`;
+  }
+  async function decrypt(payload,pw){
+    const [sb,ib,cb]=payload.split(':');
+    if(!sb||!ib||!cb)throw new Error('Bad payload');
+    const k=await dk(pw,new Uint8Array(frB64(sb)));
+    const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:new Uint8Array(frB64(ib))},k,frB64(cb));
+    return JSON.parse(dec(pt));
+  }
+  function score(pw){
+    let s=0;
+    if(!pw||pw.length<6)return 0;
+    if(pw.length>=8)s++;if(pw.length>=12)s++;
+    if(/[A-Z]/.test(pw)&&/[a-z]/.test(pw))s++;
+    if(/[0-9]/.test(pw))s++;if(/[^A-Za-z0-9]/.test(pw))s++;
+    return Math.min(s,4);
+  }
+  return{hashPw,verifyPw,encrypt,decrypt,score};
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  STORE
+// ═══════════════════════════════════════════════════════════════
+const Store=(()=>{
+  let _pw=null,_c={};
+  const uid=()=>([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g,c=>(c^crypto.getRandomValues(new Uint8Array(1))[0]&15>>c/4).toString(16));
+  const cg=k=>new Promise((res,rej)=>chrome.storage.local.get(k,r=>chrome.runtime.lastError?rej(chrome.runtime.lastError):res(r)));
+  const cs=o=>new Promise((res,rej)=>chrome.storage.local.set(o,()=>chrome.runtime.lastError?rej(chrome.runtime.lastError):res()));
+  const setPw=pw=>{_pw=pw;_c={};};
+  const clearPw=()=>{_pw=null;_c={};};
+  async function re(k){
+    if(!_pw)throw new Error('Locked');
+    if(_c[k]!==undefined)return _c[k];
+    const r=await cg([k]);if(!r[k])return null;
+    const v=await Crypto.decrypt(r[k],_pw);_c[k]=v;return v;
+  }
+  async function we(k,v){
+    if(!_pw)throw new Error('Locked');
+    await cs({[k]:await Crypto.encrypt(v,_pw)});_c[k]=v;
+  }
+  async function isReady(){return(await cg(['bk_ok'])).bk_ok===true;}
+  async function markReady(){await cs({bk_ok:true});}
+  async function setup(pw,cfg,cats){setPw(pw);await we('bk_cfg',cfg);await we('bk_exp',[]);await we('bk_cats',cats);await markReady();}
+  async function getCfg(){return re('bk_cfg');}
+  async function saveCfg(cfg){return we('bk_cfg',cfg);}
+  async function getCats(){return(await re('bk_cats'))||null;}
+  async function saveCats(cats){return we('bk_cats',cats);}
+  async function getAll(){return(await re('bk_exp'))||[];}
+  async function add(d){
+    const list=await getAll();
+    const e={id:uid(),createdAt:new Date().toISOString(),
+      date:d.date||new Date().toISOString().split('T')[0],vendor:d.vendor||'Unknown',
+      amount:parseFloat(d.amount)||0,tax:parseFloat(d.tax)||0,
+      category:d.category||'Other Deductible Expense',notes:d.notes||'',source:d.source||'chat'};
+    list.push(e);await we('bk_exp',list);return e;
+  }
+  async function del(id){await we('bk_exp',(await getAll()).filter(e=>e.id!==id));}
+  async function renameCategory(oldName,newName){
+    const list=await getAll();let n=0;
+    list.forEach(e=>{if(e.category===oldName){e.category=newName;n++;}});
+    if(n>0)await we('bk_exp',list);return n;
+  }
+  async function clearAll(){await we('bk_exp',[]);_c['bk_exp']=[];}
+  async function query({category,month,year,search}={}){
+    let list=await getAll();
+    if(category)list=list.filter(e=>e.category===category);
+    if(month)list=list.filter(e=>(new Date(e.date+'T12:00:00').getMonth()+1)===+month);
+    if(year)list=list.filter(e=>new Date(e.date+'T12:00:00').getFullYear()===+year);
+    if(search){const q=search.toLowerCase();list=list.filter(e=>e.vendor.toLowerCase().includes(q)||e.category.toLowerCase().includes(q));}
+    return list;
+  }
+  async function changePw(oldPw,newPw){
+    const cfg=await getCfg();
+    if(!await Crypto.verifyPw(oldPw,cfg.passwordHash))throw new Error('Incorrect password');
+    const exp=await getAll();const cats=await getCats();
+    _pw=newPw;_c={};
+    await we('bk_cfg',{...cfg,passwordHash:await Crypto.hashPw(newPw)});
+    await we('bk_exp',exp);await we('bk_cats',cats);
+  }
+  return{setPw,clearPw,isReady,setup,getCfg,saveCfg,getCats,saveCats,renameCategory,getAll,add,del,clearAll,query,changePw};
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  BUILT-IN CATEGORIES
+// ═══════════════════════════════════════════════════════════════
+const BUILTIN_CATS={
+  US:['Advertising & Marketing','Bank Fees & Interest','Business Insurance','Business Meals (50%)','Car & Truck Expenses','Commissions & Fees','Contract Labor','Depreciation','Employee Benefits','Home Office','Legal & Professional Services','Office Supplies & Materials','Rent & Lease','Repairs & Maintenance','Software & Subscriptions','Taxes & Licenses','Travel & Lodging','Utilities','Other Deductible Expense','Non-Deductible / Personal'],
+  CA:['Advertising','Bad Debts','Business Tax, Fees & Licences','Delivery & Freight','Depreciation (CCA)','Insurance','Interest & Bank Charges','Legal & Accounting','Maintenance & Repairs','Management & Admin Fees','Meals & Entertainment (50%)','Motor Vehicle Expenses','Office Expenses','Other Expenses','Rent','Salaries & Wages','Software & Technology','Telephone & Utilities','Travel','Non-Deductible / Personal'],
+};
+
+let _catsCache=null;
+async function getActiveCats(){
+  if(_catsCache)return _catsCache;
+  const stored=await Store.getCats();
+  _catsCache=stored||(S.cfg?[...BUILTIN_CATS[S.cfg.region||'US']]:[]);
+  return _catsCache;
+}
+function invalidateCatsCache(){_catsCache=null;}
+
+// ═══════════════════════════════════════════════════════════════
+//  GEMINI
+// ═══════════════════════════════════════════════════════════════
+const Gemini=(()=>{
+  const BASE='https://generativelanguage.googleapis.com/v1beta/models/';
+  const GC=':generateContent';
+  const URLS={'gemini-2.5-flash':BASE+'gemini-2.5-flash'+GC,'gemini-2.0-flash':BASE+'gemini-2.0-flash'+GC,'gemini-2.0-flash-lite':BASE+'gemini-2.0-flash-lite'+GC,'gemini-1.5-flash':BASE+'gemini-1.5-flash'+GC,'gemini-1.5-pro':BASE+'gemini-1.5-pro'+GC};
+  const DEFAULT_MODEL='gemini-2.5-flash';
+  function modelUrl(cfg){return URLS[cfg?.model||DEFAULT_MODEL]||URLS[DEFAULT_MODEL];}
+
+  function sysprompt(cats){
+    const region=S.cfg?.region||'US';
+    const label=region==='US'?'United States (IRS rules)':'Canada (CRA rules)';
+    const fence='```';
+    return 'You are BookkeepAI, a bookkeeping assistant for a small business in '+label+'.\n\n'
+      +'SCOPE: Only respond to expense logging, tax categorization, and financial queries. '
+      +'Politely decline everything else with a one-line message.\n\n'
+      +'ANSWERING FINANCIAL QUERIES:\n'
+      +'- Every user message includes a [DATA CONTEXT] block containing ALL their recorded expenses as JSON.\n'
+      +'- You MUST use this data to answer any question about spending, totals, or expenses.\n'
+      +'- NEVER say you lack access to transaction history. The full expense list is in every message.\n'
+      +'- Filter the expenses array by date yourself for queries like "last month" or "this year".\n'
+      +'- Format currency clearly and cite exact numbers from the data.\n\n'
+      +'LOGGING NEW EXPENSES:\n'
+      +'When logging an expense from text or receipt, output this block then a short confirmation:\n'
+      +fence+'expense_entry\n'
+      +'{"date":"YYYY-MM-DD","vendor":"Name","amount":0.00,"tax":0.00,"category":"Category Name","notes":"","confidence":1.0}\n'
+      +fence+'\n'
+      +'Confidence: 1.0=all fields clear; 0.7-0.99=minor assumption; below 0.7=ask for missing fields instead.\n\n'
+      +'APPROVED CATEGORIES (use ONLY these exact names): '+cats.join(', ')+'.\n\n'
+      +'Be concise, friendly, and always answer using the provided expense data.';
+  }
+  function ocrprompt(cats){
+    return `Analyze this receipt. Return ONLY valid JSON, no markdown:\n{"date":"YYYY-MM-DD or null","vendor":"name or null","amount":number_or_null,"tax":number_or_0,"category":"one of: ${cats.join(', ')}","notes":"brief","confidence":0.0,"low_confidence_fields":[]}`;
+  }
+  function parseEntry(text){
+    const m=text.match(/```expense_entry\s*([\s\S]*?)```/);
+    if(m){try{return JSON.parse(m[1].trim());}catch{}}return null;
+  }
+  async function callApi(apiKey,modelCfg,messages,system,imgB64,imgMime){
+    const contents=messages.map(m=>({role:m.role==='assistant'?'model':'user',parts:[{text:m.content}]}));
+    if(imgB64){
+      const last=contents[contents.length-1];
+      if(last?.role==='user')last.parts.push({inlineData:{mimeType:imgMime||'image/jpeg',data:imgB64}});
+      else contents.push({role:'user',parts:[{text:'Analyze this receipt.'},{inlineData:{mimeType:imgMime||'image/jpeg',data:imgB64}}]});
+    }
+    const body={contents,generationConfig:{temperature:0.2,maxOutputTokens:1024}};
+    if(system)body.system_instruction={parts:[{text:system}]};
+    const res=await fetch(`${modelUrl(modelCfg)}?key=${apiKey}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!res.ok){const e=await res.json().catch(()=>({}));throw new Error(e?.error?.message||`HTTP ${res.status}`);}
+    const d=await res.json();
+    const t=d?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if(!t)throw new Error('Empty response from Gemini');
+    return t;
+  }
+  async function chat(apiKey,userMsg,history,contextData,modelCfg){
+    const cats=await getActiveCats();
+    let msg=userMsg;
+    if(contextData)msg=`[DATA CONTEXT]\n${JSON.stringify(contextData)}\n\n[QUESTION]\n${userMsg}`;
+    const msgs=[...(history||[]),{role:'user',content:msg}];
+    const text=await callApi(apiKey,modelCfg,msgs,sysprompt(cats));
+    const entry=parseEntry(text);
+    return{text,entry,needsConfirm:!!(entry&&entry.confidence<0.7)};
+  }
+  async function ocr(apiKey,b64,mime,modelCfg){
+    const cats=await getActiveCats();
+    const text=await callApi(apiKey,modelCfg,[{role:'user',content:ocrprompt(cats)}],null,b64,mime);
+    const clean=text.replace(/^```[a-z]*\n?/i,'').replace(/\n?```$/,'').trim();
+    try{const d=JSON.parse(clean);return{ok:true,data:d,needsConfirm:d.confidence<0.7||(d.low_confidence_fields?.length>0)};}
+    catch{return{ok:false,error:'Could not parse receipt. Try a clearer image or type details manually.'};}
+  }
+  return{parseEntry,chat,ocr,DEFAULT_MODEL};
+})();
+
+// ═══════════════════════════════════════════════════════════════
+//  APP STATE
+// ═══════════════════════════════════════════════════════════════
+const S={cfg:null,hist:[],pend:null,file:null,busy:false,loc:null,sortCol:'date',sortDir:'desc'};
+
+// ═══════════════════════════════════════════════════════════════
+//  UTILITIES
+// ═══════════════════════════════════════════════════════════════
+const $=id=>document.getElementById(id);
+let _tt=null;
+function toast(msg,type=''){
+  const el=$('toast');el.textContent=msg;el.className=`show ${type}`;
+  if(_tt)clearTimeout(_tt);_tt=setTimeout(()=>{el.className='';},3000);
+}
+function fmtMoney(n){
+  const r=S.cfg?.region||'US';
+  return new Intl.NumberFormat(r==='US'?'en-US':'en-CA',{style:'currency',currency:r==='US'?'USD':'CAD',minimumFractionDigits:2}).format(n||0);
+}
+function fmtDate(s){
+  if(!s)return'—';
+  try{const [y,m,d]=s.split('-').map(Number);return new Date(y,m-1,d).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});}
+  catch{return s;}
+}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function md(s){return esc(s).replace(/\*\*(.*?)\*\*/g,'<strong>$1</strong>').replace(/\n/g,'<br>');}
+function csvQ(s){s=String(s||'');return(s.includes(',')||s.includes('"')||s.includes('\n'))?`"${s.replace(/"/g,'""')}"`:s;}
+function dlFile(content,name,type){
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([content],{type}));a.download=name;a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+}
+function humanError(msg){
+  if(/api.?key|invalid.?key|API_KEY_INVALID/i.test(msg))return'Invalid API key. Check your key in ⚙️ Settings.';
+  if(/no longer available|not found for API/i.test(msg))return'This model is unavailable. Go to ⚙️ Settings → AI Model and try gemini-2.0-flash.';
+  if(/quota|RESOURCE_EXHAUSTED/i.test(msg))return'API quota exceeded. Enable billing at console.cloud.google.com or switch model in ⚙️ Settings.';
+  if(/not found|404/i.test(msg))return'Model not found. Try a different model in ⚙️ Settings.';
+  return msg;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  OVERLAY & TABS
+// ═══════════════════════════════════════════════════════════════
+function showStep(id){
+  $('overlay').classList.remove('hidden');
+  ['s0','s1','s2','s3','s-lock'].forEach(s=>$(s)?.classList.add('hidden'));
+  $(id)?.classList.remove('hidden');
+}
+function hideOverlay(){$('overlay').classList.add('hidden');}
+function showTab(viewId){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));
+  document.querySelector(`.tab[data-view="${viewId}"]`)?.classList.add('on');
+  $(viewId)?.classList.add('on');
+  if(viewId==='exp-view')renderTable();
+  if(viewId==='settings-view'){renderCatManager();renderSyncUI();}
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CHAT
+// ═══════════════════════════════════════════════════════════════
+function addMsg(role,html){
+  const w=document.createElement('div');w.className=`msg ${role}`;
+  w.innerHTML=`<div class="avatar">${role==='ai'?'🤖':'👤'}</div><div class="bubble">${html}</div>`;
+  $('msgs').appendChild(w);$('msgs').scrollTop=$('msgs').scrollHeight;return w;
+}
+function showTyping(){
+  const w=document.createElement('div');w.className='msg ai';w.id='typing';
+  w.innerHTML=`<div class="avatar">🤖</div><div class="bubble"><div class="dots-anim"><span></span><span></span><span></span></div></div>`;
+  $('msgs').appendChild(w);$('msgs').scrollTop=$('msgs').scrollHeight;
+}
+function hideTyping(){$('typing')?.remove();}
+
+function rcard(e,lc=[]){
+  const conf=e.confidence??1;const cls=conf>=0.9?'g':conf>=0.7?'y':'r';
+  const warn=lc.length?`<div class="warn-banner">⚠️ Low confidence on: ${esc(lc.join(', '))}. Please verify.</div>`:'';
+  return `<div class="rcard">
+    <div class="rrow"><span class="rlabel">Date</span><span class="rval">${esc(e.date||'—')}</span></div>
+    <div class="rrow"><span class="rlabel">Vendor</span><span class="rval">${esc(e.vendor||'—')}</span></div>
+    <div class="rrow"><span class="rlabel">Amount</span><span class="rval g">${fmtMoney(e.amount)}</span></div>
+    <div class="rrow"><span class="rlabel">Tax</span><span class="rval">${fmtMoney(e.tax)}</span></div>
+    <div class="rrow"><span class="rlabel">Category</span><span class="rval"><span class="badge">${esc(e.category||'—')}</span></span></div>
+    <div class="rrow"><span class="rlabel">Confidence</span><span class="rval ${cls}">${Math.round(conf*100)}%</span></div>
+  </div>${warn}`;
+}
+async function buildCform(entry,fields){
+  const cats=await getActiveCats();
+  const show=fields.length?fields:['date','vendor','amount','tax','category'];
+  const rows=show.map(f=>{
+    if(f==='category'){const opts=cats.map(c=>`<option value="${esc(c)}"${entry.category===c?' selected':''}>${esc(c)}</option>`).join('');return`<div class="fld"><label>${f}</label><select id="cf-${f}">${opts}</select></div>`;}
+    return`<div class="fld"><label>${f}</label><input type="text" id="cf-${f}" value="${esc(String(entry[f]??''))}" /></div>`;
+  }).join('');
+  return`<div class="cform" id="cform"><strong style="font-size:12px;">✏️ Please verify / correct:</strong><div style="margin-top:8px;">${rows}</div><div class="cform-btns"><button class="btn btn-pri btn-sm" id="cf-save">✅ Save Expense</button><button class="btn btn-ghost btn-sm" id="cf-cancel">Cancel</button></div></div>`;
+}
+function wireCform(){
+  $('cf-save')?.addEventListener('click',async()=>{
+    const e=S.pend;if(!e)return;
+    ['date','vendor','amount','tax','category'].forEach(f=>{const el=$(`cf-${f}`);if(el)e[f]=(f==='amount'||f==='tax')?parseFloat(el.value)||0:el.value.trim();});
+    e.confidence=1;await saveEntry(e);S.pend=null;$('cform')?.remove();
+  });
+  $('cf-cancel')?.addEventListener('click',()=>{S.pend=null;$('cform')?.remove();addMsg('ai','Entry discarded. Ready when you are! 📒');});
+}
+async function saveEntry(e){
+  try{
+    const saved=await Store.add({...e,source:'receipt'});
+    toast(`✅ ${saved.vendor} — ${fmtMoney(saved.amount)}`,'ok');
+    addMsg('ai',`Expense logged! ✅<br><strong>${esc(saved.vendor)}</strong> · ${fmtMoney(saved.amount)} · ${esc(saved.category)}<br><span style="color:var(--muted);font-size:11px;">${fmtDate(saved.date)}</span>`);
+  }catch(err){toast(`Save failed: ${err.message}`,'err');}
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SEND
+// ═══════════════════════════════════════════════════════════════
+async function send(){
+  if(S.busy)return;
+  const text=$('txt').value.trim();const file=S.file;
+  if(!text&&!file)return;
+  if(!S.cfg?.apiKey){toast('Add your Gemini API key in ⚙️ Settings','err');return;}
+  S.busy=true;$('send').disabled=true;
+  let userHtml=md(text||'📎 Receipt image');
+  if(file)userHtml+=`<div style="margin-top:6px;"><img src="${file.url}" style="max-width:160px;max-height:120px;border-radius:7px;display:block;border:1px solid var(--border);" /></div>`;
+  addMsg('me',userHtml);
+  $('txt').value='';$('txt').style.height='auto';
+  const f=file;clearFile();
+  S.hist.push({role:'user',content:text||'I uploaded a receipt image.'});
+  showTyping();
+  try{
+    if(f){
+      const res=await Gemini.ocr(S.cfg.apiKey,f.b64,f.mime,S.cfg);
+      hideTyping();
+      if(!res.ok){addMsg('ai',`⚠️ ${esc(res.error)}`);}
+      else{
+        const lc=res.data.low_confidence_fields||[];const card=rcard(res.data,lc);
+        if(res.needsConfirm){
+          S.pend=res.data;
+          const bubble=addMsg('ai','Receipt scanned — please verify:').querySelector('.bubble');
+          bubble.innerHTML+=card+await buildCform(res.data,lc);wireCform();
+        }else{
+          const bubble=addMsg('ai','Receipt scanned! ✅').querySelector('.bubble');
+          bubble.innerHTML+=card;await saveEntry(res.data);
+        }
+      }
+    }else{
+      // Always load expenses so the AI can answer any financial query.
+      // A keyword check was unreliable — the AI receives the data on every turn.
+      const all=await Store.getAll();
+      const ctx={
+        count:all.length,
+        totalAmount:all.reduce((s,e)=>s+e.amount,0).toFixed(2),
+        totalTax:all.reduce((s,e)=>s+e.tax,0).toFixed(2),
+        currentDate:new Date().toISOString().split('T')[0],
+        expenses:all.map(e=>({date:e.date,vendor:e.vendor,amount:e.amount,tax:e.tax,category:e.category,notes:e.notes}))
+      };
+      const res=await Gemini.chat(S.cfg.apiKey,text,S.hist.slice(-10),ctx,S.cfg);
+      hideTyping();
+      const display=res.text.replace(/```expense_entry[\s\S]*?```/g,'').trim();
+      let extra='';
+      if(res.entry){
+        const lc=res.entry.confidence<0.7?['amount','vendor','date'].filter(k=>!res.entry[k]):[];
+        extra=rcard(res.entry,lc);
+        if(res.needsConfirm){S.pend=res.entry;extra+=await buildCform(res.entry,lc);}
+        else{await saveEntry(res.entry);}
+      }
+      addMsg('ai',md(display||'…')+extra);
+      if(res.needsConfirm)setTimeout(wireCform,0);
+      S.hist.push({role:'assistant',content:res.text});
+    }
+  }catch(err){hideTyping();addMsg('ai',`❌ ${esc(humanError(err.message))}`);}
+  S.busy=false;$('send').disabled=false;$('txt').focus();
+}
+function clearFile(){S.file=null;$('att').classList.remove('show');$('att-img').src='';$('att-name').textContent='';}
+
+// ═══════════════════════════════════════════════════════════════
+//  EXPENSE TABLE  (sortable)
+// ═══════════════════════════════════════════════════════════════
+function sortList(list){
+  const{sortCol,sortDir}=S;const mul=sortDir==='asc'?1:-1;
+  return[...list].sort((a,b)=>{
+    let av,bv;
+    if(sortCol==='date'){av=a.date;bv=b.date;}
+    else if(sortCol==='vendor'){av=(a.vendor||'').toLowerCase();bv=(b.vendor||'').toLowerCase();}
+    else if(sortCol==='category'){av=(a.category||'').toLowerCase();bv=(b.category||'').toLowerCase();}
+    else if(sortCol==='amount'){av=a.amount;bv=b.amount;}
+    else{av=a.date;bv=b.date;}
+    return av<bv?-1*mul:av>bv?1*mul:0;
+  });
+}
+function updateSortHeaders(){
+  document.querySelectorAll('.th-sort').forEach(th=>{
+    const col=th.dataset.col;const arrow=th.querySelector('.sort-arrow');if(!arrow)return;
+    if(col===S.sortCol){arrow.textContent=S.sortDir==='asc'?' ↑':' ↓';th.classList.add('th-active');}
+    else{arrow.textContent=' ↕';th.classList.remove('th-active');}
+  });
+}
+async function renderTable(){
+  const raw=await Store.query({category:$('f-cat')?.value||'',month:$('f-month')?.value||'',year:$('f-year')?.value||'',search:$('f-search')?.value||''});
+  const list=sortList(raw);
+  $('s-count').textContent=list.length;
+  $('s-total').textContent=fmtMoney(list.reduce((s,e)=>s+e.amount,0));
+  $('s-tax').textContent=fmtMoney(list.reduce((s,e)=>s+e.tax,0));
+  updateSortHeaders();
+  const tbody=$('tbody');tbody.innerHTML='';
+  $('empty').classList.toggle('hidden',list.length>0);
+  if(!list.length)return;
+  list.forEach(e=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${fmtDate(e.date)}</td><td style="max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.vendor)}">${esc(e.vendor)}</td><td><span class="badge" style="font-size:9px;">${esc(e.category)}</span></td><td class="acell">${fmtMoney(e.amount)}</td><td><button class="dbtn" data-id="${e.id}">🗑</button></td>`;
+    tbody.appendChild(tr);
+  });
+  tbody.querySelectorAll('.dbtn').forEach(b=>{
+    b.addEventListener('click',async()=>{await Store.del(b.dataset.id);toast('Deleted','ok');renderTable();});
+  });
+}
+function wireSortHeaders(){
+  document.querySelectorAll('.th-sort').forEach(th=>{
+    th.addEventListener('click',()=>{
+      const col=th.dataset.col;
+      if(S.sortCol===col){S.sortDir=S.sortDir==='asc'?'desc':'asc';}
+      else{S.sortCol=col;S.sortDir=col==='amount'?'desc':'asc';}
+      renderTable();
+    });
+  });
+}
+async function populateFilters(region){
+  const cats=await getActiveCats();
+  $('f-cat').innerHTML='<option value="">All Categories</option>'+cats.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  $('f-month').innerHTML='<option value="">All Months</option>'+['January','February','March','April','May','June','July','August','September','October','November','December'].map((m,i)=>`<option value="${i+1}">${m}</option>`).join('');
+  const y=new Date().getFullYear();
+  $('f-year').innerHTML='<option value="">All Years</option>'+Array.from({length:6},(_,i)=>y-i).map(y=>`<option value="${y}">${y}</option>`).join('');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  EXPORT CSV
+// ═══════════════════════════════════════════════════════════════
+async function exportCSV(){
+  const raw=await Store.query({category:$('f-cat').value,month:$('f-month').value,year:$('f-year').value,search:$('f-search').value});
+  const list=sortList(raw);
+  if(!list.length){toast('No data to export','err');return;}
+  const rows=[['Date','Vendor','Category','Amount','Tax','Notes'],...list.map(e=>[e.date,csvQ(e.vendor),csvQ(e.category),e.amount.toFixed(2),e.tax.toFixed(2),csvQ(e.notes)])];
+  dlFile(rows.map(r=>r.join(',')).join('\n'),'bookkeepai.csv','text/csv');
+  toast('CSV exported ✅','ok');
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CATEGORY MANAGER
+// ═══════════════════════════════════════════════════════════════
+async function renderCatManager(){
+  const container=$('cat-manager');if(!container)return;
+  const cats=await getActiveCats();
+  const rows=cats.map((c,i)=>`
+    <div class="cat-row" data-idx="${i}">
+      <span class="cat-name">${esc(c)}</span>
+      <div class="cat-actions">
+        <button class="cat-btn cat-edit" data-idx="${i}" title="Edit">✏️</button>
+        <button class="cat-btn cat-del"  data-idx="${i}" title="Delete">🗑</button>
+      </div>
+    </div>`).join('');
+  container.innerHTML=`
+    <div class="cat-list">${rows||'<div style="color:var(--muted);font-size:12px;padding:8px 0;">No categories yet.</div>'}</div>
+    <div class="cat-add-row">
+      <input type="text" id="cat-inp" placeholder="New category name…" maxlength="60" />
+      <button class="btn btn-pri btn-sm" id="cat-add">+ Add</button>
+    </div>`;
+
+  $('cat-add').addEventListener('click',async()=>{
+    const val=$('cat-inp').value.trim();if(!val){toast('Enter a name.','err');return;}
+    const cats=await getActiveCats();
+    if(cats.includes(val)){toast('Already exists.','err');return;}
+    cats.push(val);await Store.saveCats(cats);invalidateCatsCache();
+    $('cat-inp').value='';toast(`"${val}" added ✅`,'ok');
+    await renderCatManager();await populateFilters(S.cfg?.region||'US');
+  });
+  $('cat-inp').addEventListener('keydown',e=>{if(e.key==='Enter')$('cat-add').click();});
+
+  container.querySelectorAll('.cat-edit').forEach(btn=>{
+    btn.addEventListener('click',async()=>{
+      const idx=+btn.dataset.idx;const cats=await getActiveCats();const old=cats[idx];
+      const row=btn.closest('.cat-row');
+      row.innerHTML=`<input type="text" class="cat-edit-input" value="${esc(old)}" maxlength="60" style="flex:1;background:var(--surface2);border:1px solid var(--accent);border-radius:var(--rs);color:var(--text);padding:5px 8px;font-size:12px;font-family:inherit;outline:none;" /><div class="cat-actions"><button class="cat-btn" id="ce-save" title="Save">✅</button><button class="cat-btn" id="ce-cancel" title="Cancel">✕</button></div>`;
+      const input=row.querySelector('.cat-edit-input');input.focus();input.select();
+      row.querySelector('#ce-save').addEventListener('click',async()=>{
+        const newName=input.value.trim();if(!newName){toast('Name cannot be empty.','err');return;}
+        if(newName===old){await renderCatManager();return;}
+        const cats=await getActiveCats();
+        if(cats.includes(newName)){toast('That name already exists.','err');return;}
+        cats[idx]=newName;await Store.saveCats(cats);
+        const changed=await Store.renameCategory(old,newName);
+        invalidateCatsCache();
+        toast(`Renamed — ${changed} expense${changed!==1?'s':''} updated ✅`,'ok');
+        await renderCatManager();await populateFilters(S.cfg?.region||'US');await renderTable();
+      });
+      input.addEventListener('keydown',e=>{if(e.key==='Enter')row.querySelector('#ce-save').click();if(e.key==='Escape')row.querySelector('#ce-cancel').click();});
+      row.querySelector('#ce-cancel').addEventListener('click',()=>renderCatManager());
+    });
+  });
+
+  container.querySelectorAll('.cat-del').forEach(btn=>{
+    btn.addEventListener('click',async()=>{
+      const idx=+btn.dataset.idx;const cats=await getActiveCats();const name=cats[idx];
+      if(!confirm(`Delete "${name}"?\n\nExisting expenses keep this name in their history.`))return;
+      cats.splice(idx,1);await Store.saveCats(cats);invalidateCatsCache();
+      toast(`"${name}" deleted`,'ok');
+      await renderCatManager();await populateFilters(S.cfg?.region||'US');
+    });
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  LAUNCH
+// ═══════════════════════════════════════════════════════════════
+async function launch(cfg){
+  hideOverlay();S.cfg=cfg;invalidateCatsCache();
+  const existingCats=await Store.getCats();
+  if(!existingCats){await Store.saveCats([...BUILTIN_CATS[cfg.region||'US']]);invalidateCatsCache();}
+  $('rgn-badge').textContent=cfg.region==='US'?'🇺🇸 IRS':'🇨🇦 CRA';
+  $('set-region').value=cfg.region;$('set-model').value=cfg.model||Gemini.DEFAULT_MODEL;
+  await populateFilters(cfg.region);
+  $('msgs').innerHTML='';S.hist=[];
+  addMsg('ai',`Hello! I'm BookkeepAI, your ${cfg.region==='US'?'IRS':'CRA'} bookkeeping assistant. 📒<br><br><strong>Here's how I can help:</strong><br>• Type an expense: "Bought office supplies at Staples for $45.99"<br>• Upload a receipt using the 📎 button<br>• Ask about your spending: "How much did I spend last month?"<br><br>What would you like to do?`);
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  FIREBASE SYNC ENGINE  (REST API — no external SDK needed)
+//  Uses Firebase Auth REST API + Firestore REST API directly.
+//  All calls are plain fetch() — fully MV3 CSP compliant.
+// ═══════════════════════════════════════════════════════════════
+const Sync = (() => {
+  const PROJECT  = 'bookkeep-ai-c787f';
+  const API_KEY  = 'AIzaSyAE7U06FviTpOVd3j9sjteG8Z7-0NJHM4A';
+  const AUTH_URL = 'https://identitytoolkit.googleapis.com/v1';
+  const FS_URL   = `https://firestore.googleapis.com/v1/projects/${PROJECT}/databases/(default)/documents`;
+
+  let _idToken    = null;
+  let _uid        = null;
+  let _email      = null;
+  let _expiry     = 0;      // token expiry timestamp
+  let _refreshToken = null;
+
+  // ── Persist session in chrome.storage.local (unencrypted — tokens only) ──
+  async function saveSession(data) {
+    return new Promise(res => chrome.storage.local.set({ bk_sync_session: data }, res));
+  }
+  async function loadSession() {
+    return new Promise(res => chrome.storage.local.get(['bk_sync_session'], r => res(r.bk_sync_session || null)));
+  }
+  async function clearSession() {
+    return new Promise(res => chrome.storage.local.remove(['bk_sync_session'], res));
+  }
+
+  // ── Token refresh ─────────────────────────────────────────────
+  async function refreshToken() {
+    if (!_refreshToken) return false;
+    try {
+      const res = await fetch(`https://securetoken.googleapis.com/v1/token?key=${API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: _refreshToken }),
+      });
+      const d = await res.json();
+      if (!d.id_token) return false;
+      _idToken      = d.id_token;
+      _refreshToken = d.refresh_token;
+      _expiry       = Date.now() + (parseInt(d.expires_in) - 60) * 1000;
+      await saveSession({ idToken: _idToken, refreshToken: _refreshToken, uid: _uid, email: _email, expiry: _expiry });
+      return true;
+    } catch { return false; }
+  }
+
+  async function getToken() {
+    if (_idToken && Date.now() < _expiry) return _idToken;
+    if (_refreshToken && await refreshToken()) return _idToken;
+    return null;
+  }
+
+  // ── Auth helpers ──────────────────────────────────────────────
+  function applyAuthResult(d) {
+    _idToken      = d.idToken;
+    _uid          = d.localId;
+    _email        = d.email;
+    _refreshToken = d.refreshToken;
+    _expiry       = Date.now() + (parseInt(d.expiresIn) - 60) * 1000;
+  }
+
+  // ── Sign in with email/password ───────────────────────────────
+  async function signIn(email, password) {
+    const res = await fetch(`${AUTH_URL}/accounts:signInWithPassword?key=${API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, returnSecureToken: true }),
+    });
+    const d = await res.json();
+    if (d.error) throw new Error(d.error.message.replace(/_/g,' ').toLowerCase());
+    applyAuthResult(d);
+    await saveSession({ idToken: _idToken, refreshToken: _refreshToken, uid: _uid, email: _email, expiry: _expiry });
+    return { uid: _uid, email: _email };
+  }
+
+  // Google Sign-In not supported in extension context (OAuth client restrictions)
+  async function signInGoogle() {
+    throw new Error('Use email/password to connect sync. If you signed up with Google, set a password at bookkeep-ai-c787f.web.app first.');
+  }
+
+  // ── Restore session from storage ──────────────────────────────
+  async function restoreSession() {
+    const s = await loadSession();
+    if (!s) return null;
+    _idToken      = s.idToken;
+    _uid          = s.uid;
+    _email        = s.email;
+    _expiry       = s.expiry || 0;
+    _refreshToken = s.refreshToken;
+    // Try to get a valid token
+    const token = await getToken();
+    if (!token) { await clearSession(); return null; }
+    return { uid: _uid, email: _email };
+  }
+
+  function currentUser() {
+    return _uid ? { uid: _uid, email: _email } : null;
+  }
+
+  async function signOut() {
+    _idToken = null; _uid = null; _email = null;
+    _refreshToken = null; _expiry = 0;
+    await clearSession();
+  }
+
+  function ready() { return !!_uid; }
+
+  // ── Firestore REST helpers ────────────────────────────────────
+  // Convert a plain JS object to Firestore REST document fields
+  function toFields(obj) {
+    const fields = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (v === null || v === undefined) continue;
+      if (typeof v === 'string')  fields[k] = { stringValue: v };
+      else if (typeof v === 'number') fields[k] = { doubleValue: v };
+      else if (typeof v === 'boolean') fields[k] = { booleanValue: v };
+      else fields[k] = { stringValue: String(v) };
+    }
+    return fields;
+  }
+
+  // Convert Firestore REST document fields back to plain JS object
+  function fromFields(fields) {
+    if (!fields) return {};
+    const obj = {};
+    for (const [k, v] of Object.entries(fields)) {
+      if (v.stringValue  !== undefined) obj[k] = v.stringValue;
+      else if (v.doubleValue  !== undefined) obj[k] = v.doubleValue;
+      else if (v.integerValue !== undefined) obj[k] = parseInt(v.integerValue);
+      else if (v.booleanValue !== undefined) obj[k] = v.booleanValue;
+      else if (v.timestampValue !== undefined) obj[k] = v.timestampValue;
+      else obj[k] = null;
+    }
+    return obj;
+  }
+
+  // ── Push one expense to Firestore ─────────────────────────────
+  async function pushExpense(exp) {
+    const token = await getToken();
+    if (!token) return false;
+    const url = `${FS_URL}/expenses/${_uid}/items/${exp.id}?updateMask.fieldPaths=date&updateMask.fieldPaths=vendor&updateMask.fieldPaths=amount&updateMask.fieldPaths=tax&updateMask.fieldPaths=category&updateMask.fieldPaths=notes&updateMask.fieldPaths=source&updateMask.fieldPaths=syncedFrom`;
+    try {
+      const res = await fetch(`${FS_URL}/expenses/${_uid}/items/${exp.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({ fields: toFields({ ...exp, syncedFrom: 'extension' }) }),
+      });
+      return res.ok;
+    } catch { return false; }
+  }
+
+  // ── Pull all expenses from Firestore ──────────────────────────
+  async function pullExpenses() {
+    const token = await getToken();
+    if (!token) return [];
+    try {
+      const res = await fetch(`${FS_URL}/expenses/${_uid}/items`, {
+        headers: { 'Authorization': `Bearer ${token}` },
+      });
+      if (!res.ok) return [];
+      const d = await res.json();
+      return (d.documents || []).map(doc => {
+        const id = doc.name.split('/').pop();
+        return { id, ...fromFields(doc.fields) };
+      });
+    } catch { return []; }
+  }
+
+  // ── Full bidirectional sync ───────────────────────────────────
+  async function syncAll() {
+    if (!ready()) throw new Error('Not signed in to sync');
+    const local    = await Store.getAll();
+    const cloud    = await pullExpenses();
+    const localIds = new Set(local.map(e => e.id));
+    let pushed = 0, pulled = 0;
+    // Push all local → cloud
+    for (const e of local) { if (await pushExpense(e)) pushed++; }
+    // Pull cloud-only expenses → local
+    for (const e of cloud) {
+      if (!localIds.has(e.id)) {
+        const date = e.date || new Date().toISOString().split('T')[0];
+        await Store.add({ ...e, date, source: e.source || 'pwa-camera' });
+        pulled++;
+      }
+    }
+    return { pushed, pulled };
+  }
+
+  return { ready, currentUser, signIn, signInGoogle, restoreSession, signOut, syncAll };
+})();
+
+// ─── Sync UI ───────────────────────────────────────────────────
+async function renderSyncUI() {
+  const user = Sync.currentUser();
+  if (!$('sync-out')) return;
+  if (user) {
+    $('sync-out').classList.add('hidden');
+    $('sync-in').classList.remove('hidden');
+    $('sync-acct').textContent = user.email || 'Connected';
+  } else {
+    $('sync-out').classList.remove('hidden');
+    $('sync-in').classList.add('hidden');
+    if ($('sync-status')) $('sync-status').textContent = '';
+  }
+}
+
+function wireSyncUI() {
+  $('b-sync-in')?.addEventListener('click', async () => {
+    const email = $('sync-email')?.value.trim();
+    const pw    = $('sync-pw')?.value;
+    const err   = $('sync-err');
+    if (!email || !pw) { err.textContent = 'Enter email and password.'; return; }
+    err.textContent = '';
+    const btn = $('b-sync-in');
+    btn.textContent = '…'; btn.disabled = true;
+    try {
+      await Sync.signIn(email, pw);
+      $('sync-email').value = ''; $('sync-pw').value = '';
+      renderSyncUI();
+      toast('Sync connected ✅','ok');
+      doSync();
+    } catch(e) { err.textContent = e.message; }
+    btn.textContent = 'Sign In'; btn.disabled = false;
+  });
+
+
+  $('sync-pw')?.addEventListener('keydown', e => { if(e.key==='Enter') $('b-sync-in')?.click(); });
+  $('b-sync-now')?.addEventListener('click', doSync);
+  $('b-sync-out')?.addEventListener('click', async () => {
+    await Sync.signOut(); renderSyncUI(); toast('Sync disconnected.','');
+  });
+}
+
+async function doSync() {
+  const status = $('sync-status');
+  if (status) status.textContent = 'Syncing…';
+  try {
+    const { pushed, pulled } = await Sync.syncAll();
+    if (status) status.textContent = `Last sync: just now · ${pushed} pushed · ${pulled} pulled`;
+    if (pulled > 0) { renderTable(); toast(`↓ ${pulled} expense${pulled!==1?'s':''} pulled from mobile`,'ok'); }
+    else if (pushed > 0) toast(`↑ ${pushed} expense${pushed!==1?'s':''} pushed to cloud`,'ok');
+    else toast('Already in sync ✅','ok');
+  } catch(e) {
+    if (status) status.textContent = 'Sync failed: ' + e.message;
+    toast('Sync failed: ' + e.message,'err');
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  WIRE ALL EVENTS
+// ═══════════════════════════════════════════════════════════════
+document.addEventListener('DOMContentLoaded',async()=>{
+  // Onboarding
+  $('b-s0').addEventListener('click',()=>showStep('s1'));
+  $('loc-us').addEventListener('click',()=>{S.loc='US';$('loc-us').classList.add('on');$('loc-ca').classList.remove('on');$('b-s1').disabled=false;});
+  $('loc-ca').addEventListener('click',()=>{S.loc='CA';$('loc-ca').classList.add('on');$('loc-us').classList.remove('on');$('b-s1').disabled=false;});
+  $('b-s1').addEventListener('click',()=>{if(!S.loc){toast('Select a region first.','err');return;}showStep('s2');$('inp-key').focus();});
+  $('b-s2').addEventListener('click',()=>{const k=$('inp-key').value.trim();if(!k.startsWith('AIza')){toast('Enter a valid API key (starts with AIza).','err');return;}showStep('s3');$('inp-pw1').focus();});
+  $('inp-pw1').addEventListener('input',function(){
+    const s=Crypto.score(this.value);const wrap=$('pw-bar-wrap');
+    if(!this.value){wrap.style.display='none';return;}wrap.style.display='block';
+    const cols=['#f87171','#fb923c','#facc15','#4ade80','#22c55e'];const labs=['Very weak','Weak','Fair','Strong','Very strong'];
+    $('pw-bar').style.cssText=`width:${(s/4)*100}%;background:${cols[s]};height:4px;border-radius:2px;`;
+    $('pw-bar-label').textContent=labs[s];$('pw-bar-label').style.color=cols[s];
+  });
+  $('b-s3').addEventListener('click',async()=>{
+    const pw1=$('inp-pw1').value;const pw2=$('inp-pw2').value;const key=$('inp-key').value.trim();
+    if(pw1.length<8){toast('Password must be 8+ characters.','err');return;}
+    if(pw1!==pw2){toast('Passwords do not match.','err');return;}
+    try{
+      const hash=await Crypto.hashPw(pw1);
+      const cfg={region:S.loc,apiKey:key,model:Gemini.DEFAULT_MODEL,passwordHash:hash};
+      const cats=[...BUILTIN_CATS[S.loc]];
+      await Store.setup(pw1,cfg,cats);await launch(cfg);
+    }catch(e){toast(`Setup error: ${e.message}`,'err');}
+  });
+
+  // Lock
+  async function unlock(){
+    const pw=$('inp-lock').value;const err=$('lock-err');err.textContent='';
+    if(!pw){err.textContent='Enter your password.';return;}
+    try{
+      Store.setPw(pw);const cfg=await Store.getCfg();
+      const valid=await Crypto.verifyPw(pw,cfg.passwordHash);
+      if(!valid){Store.clearPw();err.textContent='Incorrect password.';$('inp-lock').value='';return;}
+      await launch(cfg);
+    }catch(e){Store.clearPw();err.textContent='Decryption failed. Wrong password?';}
+  }
+  $('b-unlock').addEventListener('click',unlock);
+  $('inp-lock').addEventListener('keydown',e=>{if(e.key==='Enter')unlock();});
+  $('b-lock').addEventListener('click',()=>{Store.clearPw();S.cfg=null;S.hist=[];invalidateCatsCache();$('inp-lock').value='';showStep('s-lock');$('inp-lock').focus();});
+
+  // Tabs
+  document.querySelectorAll('.tab').forEach(btn=>btn.addEventListener('click',()=>showTab(btn.dataset.view)));
+
+  // Chat
+  $('txt').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
+  $('txt').addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,96)+'px';});
+  $('send').addEventListener('click',send);
+
+  // File
+  $('file-in').addEventListener('change',e=>{
+    const file=e.target.files?.[0];if(!file)return;
+    const reader=new FileReader();
+    reader.onload=ev=>{const url=ev.target.result;S.file={b64:url.split(',')[1],mime:file.type,name:file.name,url};$('att-img').src=url;$('att-name').textContent=file.name;$('att').classList.add('show');};
+    reader.readAsDataURL(file);e.target.value='';
+  });
+  $('b-clr-att').addEventListener('click',clearFile);
+
+  // Filters
+  ['f-cat','f-month','f-year','f-search'].forEach(id=>{$(id)?.addEventListener('change',renderTable);$(id)?.addEventListener('input',renderTable);});
+
+  // Sort headers
+  wireSortHeaders();
+
+  // CSV
+  $('b-csv').addEventListener('click',exportCSV);
+
+  // Clear modal
+  $('b-clearall').addEventListener('click',()=>$('modal').classList.remove('hidden'));
+  $('b-mcancel').addEventListener('click',()=>$('modal').classList.add('hidden'));
+  $('b-mconfirm').addEventListener('click',async()=>{await Store.clearAll();$('modal').classList.add('hidden');renderTable();toast('All expenses cleared.','ok');});
+
+  // Settings
+  $('set-region').addEventListener('change',async function(){
+    if(!S.cfg)return;S.cfg.region=this.value;await Store.saveCfg(S.cfg);
+    await Store.saveCats([...BUILTIN_CATS[this.value]]);invalidateCatsCache();
+    $('rgn-badge').textContent=this.value==='US'?'🇺🇸 IRS':'🇨🇦 CRA';
+    await populateFilters(this.value);await renderCatManager();
+    toast('Region updated — categories reset to defaults.','ok');
+  });
+  $('set-model').addEventListener('change',async function(){if(!S.cfg)return;S.cfg.model=this.value;await Store.saveCfg(S.cfg);toast(`Model set to ${this.value}`,'ok');});
+  $('b-savekey').addEventListener('click',async()=>{const k=$('set-key').value.trim();if(!k){toast('Paste an API key first.','err');return;}S.cfg.apiKey=k;await Store.saveCfg(S.cfg);$('set-key').value='';toast('API key saved ✅','ok');});
+  $('b-changepw').addEventListener('click',async()=>{
+    const o=$('set-pw-old').value,n=$('set-pw-new').value;
+    if(!o||!n){toast('Fill in both fields.','err');return;}
+    if(n.length<8){toast('New password must be 8+ chars.','err');return;}
+    try{await Store.changePw(o,n);$('set-pw-old').value='';$('set-pw-new').value='';toast('Password updated ✅','ok');}
+    catch(e){toast(e.message,'err');}
+  });
+
+  // Sync UI
+  wireSyncUI();
+  // Restore Firebase session if user was previously signed in
+  Sync.restoreSession().then(user => { if(user) renderSyncUI(); });
+
+  // Also render sync UI when settings tab is opened
+  const _origShowTab = showTab;
+  // patch showTab to also render sync when settings opens
+  window._showTabOrig = showTab;
+
+  // Init
+  try{if(await Store.isReady()){showStep('s-lock');$('inp-lock').focus();}else showStep('s0');}
+  catch(e){console.error('Init error:',e);showStep('s0');}
+});
