@@ -4,7 +4,7 @@
  * Receipt scanning still requires internet (Gemini API call).
  */
 
-const CACHE_NAME    = 'bookkeepai-v9';
+const CACHE_NAME    = 'bookkeepai-20260322';
 const CACHE_STATIC  = [
   '/',
   '/index.html',
@@ -25,16 +25,23 @@ self.addEventListener('install', event => {
   );
 });
 
-// ── Activate: clean up old caches ────────────────────────────
+// ── Activate: delete ALL old caches and claim clients ────────
 self.addEventListener('activate', event => {
   event.waitUntil(
-    caches.keys().then(keys =>
-      Promise.all(
-        keys
-          .filter(key => key !== CACHE_NAME)
-          .map(key => caches.delete(key))
-      )
-    ).then(() => self.clients.claim())
+    caches.keys()
+      .then(keys => {
+        console.log('[SW] Found caches:', keys);
+        return Promise.all(
+          keys.map(key => {
+            console.log('[SW] Deleting cache:', key);
+            return caches.delete(key);
+          })
+        );
+      })
+      .then(() => {
+        console.log('[SW] All old caches cleared. Taking control.');
+        return self.clients.claim();
+      })
   );
 });
 
