@@ -163,9 +163,21 @@ const Gemini = (() => {
 
   function ocrprompt() {
     const cats = A.cats.join(', ');
-    return 'Analyze this receipt. Return ONLY valid JSON, no markdown:\n'
-      +'{"date":"YYYY-MM-DD or null","vendor":"name or null","amount":number_or_null,"tax":number_or_0,'
-      +'"category":"one of: '+cats+'","notes":"brief","confidence":0.0,"low_confidence_fields":[]}';
+    return 'You are a receipt scanning assistant. Analyze this receipt image and extract all data.'
+      +'\n\nRules:'
+      +'\n- Return ONLY a JSON object. No markdown, no code fences, no explanation before or after.'
+      +'\n- Use null for any field not visible on the receipt.'
+      +'\n- lineItems must be an array even if empty.'
+      +'\n- amount = the final total paid (including all taxes and tip).'
+      +'\n- tax = total tax amount.'
+      +'\n- category must be exactly one of: '+cats+'.'
+      +'\n- confidence = 0.0 to 1.0 based on how clearly you can read the receipt.'
+      +'\n\nReturn this exact JSON structure with real values substituted:'
+      +'\n{"date":"YYYY-MM-DD","vendor":"string","address":"string or null","receiptNumber":"string or null",'
+      +'"paymentMethod":"string or null","lineItems":[{"name":"string","qty":1,"unitPrice":0.00,"lineTotal":0.00}],'
+      +'"subtotal":0.00,"gst":0.00,"pst":0.00,"hst":0.00,"tip":0.00,'
+      +'"amount":0.00,"tax":0.00,"category":"string","notes":"string","confidence":0.9,'
+      +'"low_confidence_fields":[]}';
   }
 
   function parseEntry(text) {
@@ -193,7 +205,7 @@ const Gemini = (() => {
         ]});
       }
     }
-    const body = { contents, generationConfig: { temperature: 0.2, maxOutputTokens: 1024 } };
+    const body = { contents, generationConfig: { temperature: 0.2, maxOutputTokens: 2048 } };
     if (system) body.system_instruction = { parts: [{ text: system }] };
 
     const res = await fetch(`${modelUrl()}?key=${key}`, {
@@ -219,14 +231,66 @@ const Gemini = (() => {
   }
 
   async function ocr(b64, mime) {
-    const text  = await callApi([{ role: 'user', content: ocrprompt() }], null, b64, mime);
-    const clean = text.replace(/^```[a-z]*\n?/i,'').replace(/\n?```$/,'').trim();
+    const text = await callApi([{ role: 'user', content: ocrprompt() }], null, b64, mime);
+
+    // Try multiple strategies to extract valid JSON from the response
+    let d = null;
+
+    // Strategy 1: Direct parse after stripping markdown fences
     try {
-      const d = JSON.parse(clean);
-      return { ok: true, data: d, needsConfirm: d.confidence < 0.7 || (d.low_confidence_fields?.length > 0) };
-    } catch {
-      return { ok: false, error: 'Could not parse receipt. Try a clearer image.' };
+      const clean = text
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```\s*$/, '')
+        .trim();
+      d = JSON.parse(clean);
+    } catch {}
+
+    // Strategy 2: Find the first { ... } block in the response
+    if (!d) {
+      try {
+        const match = text.match(/\{[\s\S]*\}/);
+        if (match) d = JSON.parse(match[0]);
+      } catch {}
     }
+
+    // Strategy 3: Try to extract just the core fields if JSON is malformed
+    if (!d) {
+      try {
+        // Sometimes Gemini adds trailing commas or comments — try to clean those
+        const cleaned = text
+          .replace(/^[^{]*/,'')        // remove anything before first {
+          .replace(/[^}]*$/, '')        // remove anything after last }
+          .replace(/,\s*}/g, '}')      // trailing commas before }
+          .replace(/,\s*]/g, ']')      // trailing commas before ]
+          .trim();
+        d = JSON.parse(cleaned);
+      } catch {}
+    }
+
+    if (!d) {
+      console.error('[OCR] All parse strategies failed. Length:', text.length);
+      return { ok: false, error: 'Could not read receipt data. Please try again or enter details manually.' };
+    }
+
+    // Ensure lineItems is always an array
+    if (!Array.isArray(d.lineItems)) d.lineItems = [];
+
+    // Ensure numeric fields are numbers not strings
+    ['amount','tax','subtotal','gst','pst','hst','tip'].forEach(f => {
+      if (d[f] !== null && d[f] !== undefined) d[f] = parseFloat(d[f]) || 0;
+    });
+    d.lineItems = d.lineItems.map(li => ({
+      ...li,
+      qty:       li.qty       ? parseFloat(li.qty)       : null,
+      unitPrice: li.unitPrice ? parseFloat(li.unitPrice) : null,
+      lineTotal: parseFloat(li.lineTotal) || 0,
+    }));
+
+    return {
+      ok: true,
+      data: d,
+      needsConfirm: (d.confidence || 0) < 0.7 || (d.low_confidence_fields?.length > 0),
+    };
   }
 
   return { parseEntry, chat, ocr };
@@ -325,11 +389,43 @@ function rcard(e, lc = []) {
   const conf = e.confidence ?? 1;
   const cls  = conf >= 0.9 ? 'g' : conf >= 0.7 ? 'y' : 'r';
   const warn = lc.length ? `<div class="warn-banner">⚠️ Low confidence: ${esc(lc.join(', '))}. Verify below.</div>` : '';
+
+  // Line items section
+  let lineItemsHtml = '';
+  if (e.lineItems && e.lineItems.length > 0) {
+    const rows = e.lineItems.map(li => `
+      <div class="rrow" style="font-size:11px;">
+        <span class="rl" style="flex:1;">${esc(li.name||'Item')}</span>
+        ${li.qty ? `<span style="color:var(--muted);margin-right:8px;">x${li.qty}</span>` : ''}
+        ${li.unitPrice ? `<span style="color:var(--muted);margin-right:8px;">${fmtMoney(li.unitPrice)}</span>` : ''}
+        <span class="rv">${fmtMoney(li.lineTotal||0)}</span>
+      </div>`).join('');
+    lineItemsHtml = `<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--border);">
+      <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px;">Line Items</div>
+      ${rows}
+    </div>`;
+  }
+
+  // Tax breakdown — show named taxes if available, else fall back to total tax
+  const taxParts = [];
+  if (e.gst) taxParts.push(`GST ${fmtMoney(e.gst)}`);
+  if (e.pst) taxParts.push(`PST ${fmtMoney(e.pst)}`);
+  if (e.hst) taxParts.push(`HST ${fmtMoney(e.hst)}`);
+  // If no named taxes but we have a total tax, show it
+  if (!taxParts.length && (e.tax || e.tax === 0)) taxParts.push(`Tax ${fmtMoney(e.tax)}`);
+  const taxBreakdown = taxParts.join(' · ') || '—';
+
   return `<div class="rcard">
     <div class="rrow"><span class="rl">Date</span><span class="rv">${esc(e.date||'—')}</span></div>
     <div class="rrow"><span class="rl">Vendor</span><span class="rv">${esc(e.vendor||'—')}</span></div>
-    <div class="rrow"><span class="rl">Amount</span><span class="rv g">${fmtMoney(e.amount)}</span></div>
-    <div class="rrow"><span class="rl">Tax</span><span class="rv">${fmtMoney(e.tax)}</span></div>
+    ${e.address ? `<div class="rrow"><span class="rl">Address</span><span class="rv" style="font-size:11px;">${esc(e.address)}</span></div>` : ''}
+    ${e.receiptNumber ? `<div class="rrow"><span class="rl">Receipt #</span><span class="rv">${esc(e.receiptNumber)}</span></div>` : ''}
+    ${e.paymentMethod ? `<div class="rrow"><span class="rl">Payment</span><span class="rv">${esc(e.paymentMethod)}</span></div>` : ''}
+    ${lineItemsHtml}
+    ${e.subtotal ? `<div class="rrow"><span class="rl">Subtotal</span><span class="rv">${fmtMoney(e.subtotal)}</span></div>` : ''}
+    <div class="rrow"><span class="rl">Tax</span><span class="rv">${taxBreakdown}</span></div>
+    ${e.tip ? `<div class="rrow"><span class="rl">Tip</span><span class="rv">${fmtMoney(e.tip)}</span></div>` : ''}
+    <div class="rrow"><span class="rl">Total</span><span class="rv g" style="font-size:14px;font-weight:700;">${fmtMoney(e.amount)}</span></div>
     <div class="rrow"><span class="rl">Category</span><span class="rv"><span class="badge">${esc(e.category||'—')}</span></span></div>
     <div class="rrow"><span class="rl">Confidence</span><span class="rv ${cls}">${Math.round(conf*100)}%</span></div>
   </div>${warn}`;
@@ -357,11 +453,14 @@ async function buildCform(entry, fields) {
 function wireCform() {
   $('cf-save')?.addEventListener('click', async () => {
     const e = A.pend; if (!e) return;
+    // Update only the editable header fields — preserve ALL rich receipt data
     ['date','vendor','amount','tax','category'].forEach(f => {
       const el = $(`cf-${f}`);
       if (el) e[f] = (f==='amount'||f==='tax') ? parseFloat(el.value)||0 : el.value.trim();
     });
     e.confidence = 1;
+    // Rich fields are preserved on the pend object: lineItems, gst, pst, hst,
+    // subtotal, tip, paymentMethod, address, receiptNumber
     await saveExpense(e);
     A.pend = null; $('cform')?.remove();
   });
@@ -510,6 +609,182 @@ function updateSortHeaders() {
   });
 }
 
+// ── Detail Panel ─────────────────────────────────────────────
+function openDetailPanel(e) {
+  // Remove any existing panel
+  $('detail-panel')?.remove();
+
+  const cats = A.cats;
+  const catOpts = cats.map(c =>
+    `<option value="${esc(c)}"${e.category===c?' selected':''}>${esc(c)}</option>`
+  ).join('');
+
+  // Line items editor
+  const renderLineItems = (items) => {
+    if (!items || !items.length) return '<p style="font-size:12px;color:var(--muted);">No line items captured.</p>';
+    return items.map((li, i) => `
+      <div class="li-edit-row" data-idx="${i}">
+        <input class="li-inp li-name-inp" type="text" value="${esc(li.name||'')}" placeholder="Item name" data-field="name" data-idx="${i}" />
+        <input class="li-inp li-qty-inp"  type="number" value="${li.qty||''}" placeholder="Qty" min="0" step="any" data-field="qty" data-idx="${i}" />
+        <input class="li-inp li-price-inp" type="number" value="${li.unitPrice||''}" placeholder="Unit $" min="0" step="0.01" data-field="unitPrice" data-idx="${i}" />
+        <input class="li-inp li-total-inp" type="number" value="${li.lineTotal||''}" placeholder="Total" min="0" step="0.01" data-field="lineTotal" data-idx="${i}" />
+        <button class="li-del-btn" data-idx="${i}">✕</button>
+      </div>`).join('');
+  };
+
+  // Tax breakdown display
+  const taxParts = [];
+  if (e.gst) taxParts.push(`<span class="dp-tax-item">GST <strong>${fmtMoney(e.gst)}</strong></span>`);
+  if (e.pst) taxParts.push(`<span class="dp-tax-item">PST <strong>${fmtMoney(e.pst)}</strong></span>`);
+  if (e.hst) taxParts.push(`<span class="dp-tax-item">HST <strong>${fmtMoney(e.hst)}</strong></span>`);
+  const taxHtml = taxParts.length
+    ? `<div class="dp-tax-row">${taxParts.join('')}</div>`
+    : `<div class="dp-tax-row"><span class="dp-tax-item">Tax <strong>${fmtMoney(e.tax||0)}</strong></span></div>`;
+
+  const panel = document.createElement('div');
+  panel.id = 'detail-panel';
+  panel.className = 'detail-panel';
+  panel.innerHTML = `
+    <div class="dp-overlay"></div>
+    <div class="dp-sheet">
+      <div class="dp-header">
+        <div>
+          <div class="dp-title">${esc(e.vendor||'Expense')}</div>
+          <div class="dp-subtitle">${fmtDate(e.date)}</div>
+        </div>
+        <button class="dp-close" id="dp-close">✕</button>
+      </div>
+
+      <div class="dp-body">
+
+        <!-- Editable header fields -->
+        <div class="dp-section">
+          <div class="dp-section-title">Receipt Details</div>
+          <div class="dp-field-row">
+            <div class="fld" style="flex:1;"><label>Date</label>
+              <input type="date" id="dp-date" value="${e.date||''}" /></div>
+            <div class="fld" style="flex:1;"><label>Total Amount</label>
+              <input type="number" id="dp-amount" value="${e.amount||''}" step="0.01" min="0" /></div>
+          </div>
+          <div class="fld"><label>Vendor</label>
+            <input type="text" id="dp-vendor" value="${esc(e.vendor||'')}" /></div>
+          <div class="fld"><label>Category</label>
+            <select id="dp-category">${catOpts}</select></div>
+          <div class="dp-check-row">
+            <label class="dp-check-label">
+              <input type="checkbox" id="dp-deductible" ${e.deductible ? 'checked' : ''} />
+              <span>Tax deductible expense</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Read-only receipt info -->
+        ${(e.address||e.receiptNumber||e.paymentMethod) ? `
+        <div class="dp-section">
+          <div class="dp-section-title">Receipt Info</div>
+          ${e.address ? `<div class="dp-info-row"><span class="dp-label">Address</span><span class="dp-val">${esc(e.address)}</span></div>` : ''}
+          ${e.receiptNumber ? `<div class="dp-info-row"><span class="dp-label">Receipt #</span><span class="dp-val">${esc(e.receiptNumber)}</span></div>` : ''}
+          ${e.paymentMethod ? `<div class="dp-info-row"><span class="dp-label">Payment</span><span class="dp-val">${esc(e.paymentMethod)}</span></div>` : ''}
+        </div>` : ''}
+
+        <!-- Tax breakdown -->
+        <div class="dp-section">
+          <div class="dp-section-title">Tax Breakdown</div>
+          ${taxHtml}
+          ${e.subtotal ? `<div class="dp-info-row"><span class="dp-label">Subtotal</span><span class="dp-val">${fmtMoney(e.subtotal)}</span></div>` : ''}
+          ${e.tip ? `<div class="dp-info-row"><span class="dp-label">Tip</span><span class="dp-val">${fmtMoney(e.tip)}</span></div>` : ''}
+        </div>
+
+        <!-- Line items -->
+        <div class="dp-section">
+          <div class="dp-section-title" style="display:flex;justify-content:space-between;align-items:center;">
+            Line Items
+            <button class="btn btn-ghost btn-sm" id="dp-add-item" style="padding:3px 10px;font-size:11px;">+ Add</button>
+          </div>
+          <div id="dp-line-items">${renderLineItems(e.lineItems||[])}</div>
+        </div>
+
+      </div>
+
+      <div class="dp-footer">
+        <button class="btn btn-ghost" id="dp-cancel">Cancel</button>
+        <button class="btn btn-pri"   id="dp-save">Save Changes</button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(panel);
+
+  // Working copy of line items
+  let workingItems = JSON.parse(JSON.stringify(e.lineItems || []));
+
+  // Re-render line items in panel
+  function refreshLineItems() {
+    $('dp-line-items').innerHTML = workingItems.length
+      ? workingItems.map((li, i) => `
+        <div class="li-edit-row" data-idx="${i}">
+          <input class="li-inp li-name-inp" type="text" value="${esc(li.name||'')}" placeholder="Item name" data-field="name" data-idx="${i}" />
+          <input class="li-inp li-qty-inp"  type="number" value="${li.qty||''}" placeholder="Qty" min="0" step="any" data-field="qty" data-idx="${i}" />
+          <input class="li-inp li-price-inp" type="number" value="${li.unitPrice||''}" placeholder="Unit $" min="0" step="0.01" data-field="unitPrice" data-idx="${i}" />
+          <input class="li-inp li-total-inp" type="number" value="${li.lineTotal||''}" placeholder="Total" min="0" step="0.01" data-field="lineTotal" data-idx="${i}" />
+          <button class="li-del-btn" data-idx="${i}">✕</button>
+        </div>`).join('')
+      : '<p style="font-size:12px;color:var(--muted);">No line items. Tap + Add to add one.</p>';
+    wireLineItemEvents();
+  }
+
+  function wireLineItemEvents() {
+    $('dp-line-items').querySelectorAll('.li-inp').forEach(inp => {
+      inp.addEventListener('input', () => {
+        const idx   = +inp.dataset.idx;
+        const field = inp.dataset.field;
+        workingItems[idx] = workingItems[idx] || {};
+        workingItems[idx][field] = (field==='name') ? inp.value : (parseFloat(inp.value)||null);
+      });
+    });
+    $('dp-line-items').querySelectorAll('.li-del-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        workingItems.splice(+btn.dataset.idx, 1);
+        refreshLineItems();
+      });
+    });
+  }
+
+  wireLineItemEvents();
+
+  // Add line item
+  $('dp-add-item').addEventListener('click', () => {
+    workingItems.push({ name:'', qty:null, unitPrice:null, lineTotal:0 });
+    refreshLineItems();
+  });
+
+  // Close
+  function closePanel() { panel.classList.remove('open'); setTimeout(()=>panel.remove(), 300); }
+  $('dp-close').addEventListener('click', closePanel);
+  $('dp-cancel').addEventListener('click', closePanel);
+  panel.querySelector('.dp-overlay').addEventListener('click', closePanel);
+
+  // Save
+  $('dp-save').addEventListener('click', async () => {
+    const updates = {
+      date:       $('dp-date')?.value || e.date,
+      vendor:     $('dp-vendor')?.value.trim() || e.vendor,
+      amount:     parseFloat($('dp-amount')?.value) || e.amount,
+      category:   $('dp-category')?.value || e.category,
+      deductible: $('dp-deductible')?.checked || false,
+      lineItems:  workingItems.filter(li => li.name || li.lineTotal),
+    };
+    try {
+      await FB.updateExpense(e.id, updates);
+      toast('Expense updated ✅', 'ok');
+      closePanel();
+    } catch(err) { toast('Save failed: ' + err.message, 'err'); }
+  });
+
+  // Animate in
+  requestAnimationFrame(() => panel.classList.add('open'));
+}
+
 async function renderTable() {
   const cat    = $('f-cat')?.value    || '';
   const month  = $('f-month')?.value  || '';
@@ -537,19 +812,69 @@ async function renderTable() {
   if (!list.length) return;
 
   list.forEach(e => {
+    const hasItems = e.lineItems && e.lineItems.length > 0;
+    const deductBadge = e.deductible
+      ? '<span style="font-size:9px;color:var(--green);margin-left:4px;">✓</span>' : '';
+
+    // Summary row
     const tr = document.createElement('tr');
+    tr.className = 'expense-row';
+    tr.dataset.id = e.id;
     tr.innerHTML = `
       <td>${fmtDate(e.date)}</td>
-      <td style="max-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.vendor)}">${esc(e.vendor)}</td>
-      <td><span class="badge" style="font-size:9px;">${esc(e.category)}</span></td>
+      <td style="max-width:75px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.vendor)}">${esc(e.vendor)}</td>
+      <td><span class="badge" style="font-size:9px;">${esc(e.category)}</span>${deductBadge}</td>
       <td class="acell">${fmtMoney(e.amount)}</td>
-      <td><button class="dbtn" data-id="${e.id}">🗑</button></td>`;
+      <td style="white-space:nowrap;">
+        ${hasItems ? `<button class="expand-btn" data-id="${e.id}" title="Show line items">▶</button>` : ''}
+        <button class="dbtn" data-id="${e.id}">🗑</button>
+      </td>`;
     tbody.appendChild(tr);
+
+    // Click row → open detail panel
+    tr.addEventListener('click', (ev) => {
+      if (ev.target.classList.contains('dbtn') || ev.target.classList.contains('expand-btn')) return;
+      openDetailPanel(e);
+    });
+
+    // Expand arrow → inline line items
+    if (hasItems) {
+      tr.querySelector('.expand-btn')?.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const btn = ev.currentTarget;
+        const existingDetail = tbody.querySelector(`tr.line-items-row[data-parent="${e.id}"]`);
+        if (existingDetail) {
+          existingDetail.remove();
+          btn.textContent = '▶';
+          btn.style.transform = '';
+        } else {
+          const detailTr = document.createElement('tr');
+          detailTr.className = 'line-items-row';
+          detailTr.dataset.parent = e.id;
+          const itemRows = e.lineItems.map(li => `
+            <div class="li-row">
+              <span class="li-name">${esc(li.name||'Item')}</span>
+              ${li.qty ? `<span class="li-qty">x${li.qty}</span>` : ''}
+              ${li.unitPrice ? `<span class="li-unit">${fmtMoney(li.unitPrice)}</span>` : ''}
+              <span class="li-total">${fmtMoney(li.lineTotal||0)}</span>
+            </div>`).join('');
+          detailTr.innerHTML = `<td colspan="5" style="padding:0 12px 10px 24px;background:var(--surface);">
+            <div class="li-container">${itemRows}</div>
+          </td>`;
+          tr.insertAdjacentElement('afterend', detailTr);
+          btn.textContent = '▼';
+          btn.style.transform = '';
+        }
+      });
+    }
   });
 
   tbody.querySelectorAll('.dbtn').forEach(b => {
-    b.addEventListener('click', async () => {
+    b.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
       await FB.deleteExpense(b.dataset.id);
+      // Also remove any expanded line items row
+      tbody.querySelector(`tr.line-items-row[data-parent="${b.dataset.id}"]`)?.remove();
       toast('Deleted', 'ok');
     });
   });
@@ -577,11 +902,47 @@ function populateFilters() {
 
 async function exportCSV() {
   if (!A.expenses.length) { toast('No data to export','err'); return; }
-  const list = sortExpenses(A.expenses);
-  const rows = [['Date','Vendor','Category','Amount','Tax','Notes','Source'],
-    ...list.map(e=>[e.date,csvQ(e.vendor),csvQ(e.category),(e.amount||0).toFixed(2),(e.tax||0).toFixed(2),csvQ(e.notes),e.source||''])];
-  dlFile(rows.map(r=>r.join(',')).join('\n'), 'bookkeepai.csv', 'text/csv');
-  toast('CSV exported ✅','ok');
+
+  // Show deductible filter modal before exporting
+  const modal = document.createElement('div');
+  modal.className = 'modal-bg';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:60;display:flex;align-items:flex-end;justify-content:center;padding:0;';
+  modal.innerHTML = `
+    <div style="background:var(--surface);border-top:1px solid var(--border);border-radius:16px 16px 0 0;
+      padding:24px 20px 32px;width:100%;max-width:460px;">
+      <h3 style="font-size:15px;margin-bottom:8px;">📥 Export CSV</h3>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:18px;line-height:1.6;">
+        Which expenses do you want to export?
+      </p>
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        <button class="btn btn-pri" id="csv-all">Export All Expenses</button>
+        <button class="btn btn-ghost" id="csv-deductible">Export Deductible Only</button>
+        <button class="btn btn-ghost" id="csv-cancel" style="color:var(--red);">Cancel</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+
+  const doExport = (deductibleOnly) => {
+    modal.remove();
+    let list = sortExpenses(A.expenses);
+    if (deductibleOnly) list = list.filter(e => e.deductible);
+    if (!list.length) { toast('No matching expenses to export','err'); return; }
+    const rows = [
+      ['Date','Vendor','Category','Amount','Tax','Deductible'],
+      ...list.map(e => [
+        e.date, csvQ(e.vendor), csvQ(e.category),
+        (e.amount||0).toFixed(2),
+        (e.tax||0).toFixed(2),
+        e.deductible ? 'Yes' : 'No',
+      ])
+    ];
+    dlFile(rows.map(r=>r.join(',')).join('\n'), 'bookkeepai.csv', 'text/csv');
+    toast(`CSV exported — ${list.length} expense${list.length!==1?'s':''}  ✅`,'ok');
+  };
+
+  modal.querySelector('#csv-all').addEventListener('click', () => doExport(false));
+  modal.querySelector('#csv-deductible').addEventListener('click', () => doExport(true));
+  modal.querySelector('#csv-cancel').addEventListener('click', () => modal.remove());
 }
 
 // ═══════════════════════════════════════════════════════════════
