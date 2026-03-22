@@ -24,10 +24,10 @@ BookkeepAI is a two-part bookkeeping assistant for small business owners. Log ex
 
 ## Products
 
-| Product | Platform | Cost | Data |
-|---|---|---|---|
-| **BookkeepAI Extension** | Chrome (Desktop) | Free | Encrypted locally on your device |
-| **BookkeepAI Mobile** | PWA (iOS + Android) | One-time purchase | Firebase cloud sync |
+| Product                  | Platform            | Cost         | Data                             |
+| ------------------------ | ------------------- | ------------ | -------------------------------- |
+| **BookkeepAI Extension** | Chrome (Desktop)    | Free         | Encrypted locally on your device |
+| **BookkeepAI Mobile**    | PWA (iOS + Android) | Subscription | Firebase cloud sync              |
 
 Both products share the same backend — expenses logged on mobile sync instantly to the extension and vice versa.
 
@@ -35,7 +35,7 @@ Both products share the same backend — expenses logged on mobile sync instantl
 
 ## How It Works
 
-1. **Log** — Type an expense in plain English: *"Lunch at Ganh Viet for $39.20"*
+1. **Log** — Type an expense in plain English: _"Lunch at Ganh Viet for $39.20"_
 2. **Snap** — Photograph a receipt on your phone. AI extracts every line item automatically
 3. **Review** — Tap any expense to see the full receipt breakdown — line items, taxes, tip, payment method
 4. **Export** — Download a CSV for your accountant, filtered by deductible expenses only
@@ -45,6 +45,7 @@ Both products share the same backend — expenses logged on mobile sync instantl
 ## Features
 
 ### 📱 BookkeepAI Mobile (PWA)
+
 - 📷 Camera receipt scanning — point, shoot, logged
 - 🧾 Full receipt detail — line items, GST/PST/HST, tip, payment method
 - ✅ Deductible flag — mark expenses as tax deductible
@@ -53,6 +54,7 @@ Both products share the same backend — expenses logged on mobile sync instantl
 - 📥 CSV export — all expenses or deductible only
 
 ### 💻 BookkeepAI Extension (Chrome)
+
 - 💬 Conversational expense logging via AI chat
 - 📸 Receipt OCR — upload a photo, AI extracts all fields
 - 🗂 Custom category management (IRS & CRA tax categories)
@@ -75,6 +77,7 @@ Your data stays yours.
 ## Get Started
 
 ### Chrome Extension (Free)
+
 1. Download or clone this repository
 2. Go to `chrome://extensions` in Chrome
 3. Enable **Developer Mode**
@@ -82,6 +85,7 @@ Your data stays yours.
 5. Click the 📒 BookkeepAI icon in your toolbar
 
 ### BookkeepAI Mobile
+
 1. Open [bookkeep-ai-c787f.web.app](https://bookkeep-ai-c787f.web.app) on your phone
 2. Tap **Add to Home Screen** to install it as an app
 3. Sign up and complete the one-time purchase
