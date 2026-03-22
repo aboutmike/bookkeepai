@@ -1,9 +1,24 @@
 # 📒 BookkeepAI
 
-> AI-powered bookkeeping for small businesses — available as a Chrome Extension (free) and Mobile PWA (paid).
+> AI-powered bookkeeping for small businesses — snap receipts, log expenses, and prepare for tax season.
 
-![Version](https://img.shields.io/badge/version-3.2.0-blue)
+![Version](https://img.shields.io/badge/version-3.3.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+![Platform](https://img.shields.io/badge/platform-Chrome%20%7C%20iOS%20%7C%20Android-lightgrey)
+
+---
+
+<p align="center">
+  <a href="https://bookkeep-ai-c787f.web.app">
+    <img src="https://img.shields.io/badge/Open_BookkeepAI_Mobile-Launch_App-6c8ef5?style=for-the-badge" alt="Launch BookkeepAI Mobile" />
+  </a>
+</p>
+
+---
+
+## What is BookkeepAI?
+
+BookkeepAI is a two-part bookkeeping assistant for small business owners. Log expenses by chatting with AI, scan receipts with your phone camera, and get organized for tax season — without a spreadsheet in sight.
 
 ---
 
@@ -11,127 +26,68 @@
 
 | Product | Platform | Cost | Data |
 |---|---|---|---|
-| **BookkeepAI Extension** | Chrome (Desktop) | Free | Local encrypted storage |
+| **BookkeepAI Extension** | Chrome (Desktop) | Free | Encrypted locally on your device |
 | **BookkeepAI Mobile** | PWA (iOS + Android) | One-time purchase | Firebase cloud sync |
 
-Both products share the same Firebase backend — expenses logged on mobile sync instantly to the extension and vice versa.
+Both products share the same backend — expenses logged on mobile sync instantly to the extension and vice versa.
 
 ---
 
-## Repository Structure
+## How It Works
 
-```
-bookkeepai/
-├── extension/          Chrome MV3 side-panel extension
-│   ├── manifest.json
-│   ├── bookkeepai.js   Complete application logic
-│   ├── sidepanel.html  Full UI
-│   ├── background.js
-│   └── icons/
-│
-├── pwa/                Mobile PWA (Firebase Hosting)
-│   ├── index.html      Full mobile UI
-│   ├── app.js          PWA application logic
-│   ├── firebase.js     Firebase Auth + Firestore layer
-│   ├── stripe.js       Stripe subscription gate
-│   ├── sw.js           Service worker (offline support)
-│   ├── manifest.json   PWA web manifest
-│   └── icons/
-│
-├── functions/          Firebase Cloud Functions (Stripe backend)
-│   ├── index.js        createCheckoutSession, createPortalSession, stripeWebhook
-│   ├── package.json
-│   └── .env            ← NOT in Git (secrets)
-│
-├── firebase.json       Firebase Hosting + Functions config
-├── .firebaserc         Firebase project binding
-├── .gitignore
-├── CHANGELOG.md
-├── LICENSE
-└── README.md
-```
+1. **Log** — Type an expense in plain English: *"Lunch at Ganh Viet for $39.20"*
+2. **Snap** — Photograph a receipt on your phone. AI extracts every line item automatically
+3. **Review** — Tap any expense to see the full receipt breakdown — line items, taxes, tip, payment method
+4. **Export** — Download a CSV for your accountant, filtered by deductible expenses only
 
 ---
 
-## Chrome Extension — Free Tier
+## Features
 
-### Features
+### 📱 BookkeepAI Mobile (PWA)
+- 📷 Camera receipt scanning — point, shoot, logged
+- 🧾 Full receipt detail — line items, GST/PST/HST, tip, payment method
+- ✅ Deductible flag — mark expenses as tax deductible
+- 🔄 Real-time sync with Chrome extension
+- 📴 Works offline — syncs when back online
+- 📥 CSV export — all expenses or deductible only
+
+### 💻 BookkeepAI Extension (Chrome)
 - 💬 Conversational expense logging via AI chat
 - 📸 Receipt OCR — upload a photo, AI extracts all fields
-- 🔐 AES-256-GCM local encryption
-- 🇺🇸 🇨🇦 IRS & CRA tax categories
-- 🗂 Custom category management
-- 📊 Sortable expense table with CSV export
-- 📱 Optional Mobile Sync (requires BookkeepAI Mobile account)
-
-### Installation
-1. Clone this repo
-2. Go to `chrome://extensions` → Enable Developer Mode
-3. Click **Load Unpacked** → select the `extension/` folder
-4. Click the BookkeepAI icon in Chrome toolbar
+- 🗂 Custom category management (IRS & CRA tax categories)
+- 📊 Sortable expense table
+- 📱 Optional sync with BookkeepAI Mobile
 
 ---
 
-## BookkeepAI Mobile — Paid PWA
+## Privacy
 
-### Features
-- 📷 Camera receipt scanning — point, shoot, logged
-- 🔄 Real-time sync with Chrome extension via Firebase
-- 💬 Same AI chat interface, optimised for mobile
-- 📴 Works offline, syncs when reconnected
-- 🔒 Your Gemini API key, your data — full privacy
+Your data stays yours.
 
-### Live App
-🌐 **[bookkeep-ai-c787f.web.app](https://bookkeep-ai-c787f.web.app)**
+- **No server-side storage of your expenses** — the Chrome extension stores everything encrypted on your own device using AES-256-GCM
+- **Your own AI key** — BookkeepAI uses your own Gemini API key. Your receipts are sent directly from your device to Google — never through our servers
+- **Firebase sync is optional** — only enabled when you sign in to BookkeepAI Mobile
+- **No ads. No data selling.**
 
 ---
 
-## Tech Stack
+## Get Started
 
-| Layer | Technology |
-|---|---|
-| Extension UI | Vanilla HTML/CSS/JS — zero dependencies |
-| Mobile UI | Vanilla HTML/CSS/JS — zero dependencies |
-| AI / OCR | Google Gemini API (user's own key) |
-| Encryption (extension) | Web Crypto API — AES-256-GCM + PBKDF2 |
-| Auth | Firebase Authentication |
-| Database | Firebase Firestore |
-| Payments | Stripe (via Firebase Cloud Functions) |
-| Hosting | Firebase Hosting |
-| Extension storage | `chrome.storage.local` (encrypted) |
+### Chrome Extension (Free)
+1. Download or clone this repository
+2. Go to `chrome://extensions` in Chrome
+3. Enable **Developer Mode**
+4. Click **Load Unpacked** → select the `extension/` folder
+5. Click the 📒 BookkeepAI icon in your toolbar
 
----
+### BookkeepAI Mobile
+1. Open [bookkeep-ai-c787f.web.app](https://bookkeep-ai-c787f.web.app) on your phone
+2. Tap **Add to Home Screen** to install it as an app
+3. Sign up and complete the one-time purchase
+4. Add your Gemini API key in Settings
 
-## Development Setup
-
-### Prerequisites
-- Node.js 20+
-- Firebase CLI: `npm install -g firebase-tools`
-- A Firebase project (see `DEPLOY.md`)
-- A Stripe account (see `DEPLOY.md`)
-
-### Deploy PWA + Functions
-```bash
-firebase login
-firebase use bookkeep-ai-c787f
-cd functions && npm install && cd ..
-firebase deploy --only "functions,hosting"
-```
-
-### Load Extension Locally
-1. Make changes in `extension/`
-2. Go to `chrome://extensions` → click the refresh icon on BookkeepAI
-
----
-
-## Environment Variables
-
-Create `functions/.env` (never committed to Git):
-```
-STRIPE_SECRET_KEY=sk_live_...
-STRIPE_PRICE_ID=price_...
-STRIPE_WEBHOOK_SECRET=whsec_...
-```
+> Get a free Gemini API key at [aistudio.google.com](https://aistudio.google.com)
 
 ---
 
