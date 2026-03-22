@@ -6,6 +6,15 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [3.3.1] — 2026-03-22
+
+### PWA
+- Fixed AI chat returning expenses not flagged as deductible when asked "list tax deductible expenses"
+- `deductible` field now included in expense data context sent to Gemini on every chat message
+- Fixed AI modifying category names (e.g. appending "generally 50% deductible") — system prompt now instructs AI to use exact category strings from data, never infer or reformat them
+
+---
+
 ## [3.3.0] — 2026-03-22
 
 ### PWA

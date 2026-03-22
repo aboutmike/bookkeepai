@@ -4,7 +4,7 @@
  * Receipt scanning still requires internet (Gemini API call).
  */
 
-const CACHE_NAME    = 'bookkeepai-v8';
+const CACHE_NAME    = 'bookkeepai-v9';
 const CACHE_STATIC  = [
   '/',
   '/index.html',

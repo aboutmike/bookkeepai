@@ -157,8 +157,13 @@ const Gemini = (() => {
       +'{"date":"YYYY-MM-DD","vendor":"Name","amount":0.00,"tax":0.00,"category":"Category Name","notes":"","confidence":1.0}\n'
       +fence+'\n'
       +'Confidence: 1.0=clear; 0.7-0.99=minor assumption; below 0.7=ask for missing fields.\n\n'
-      +'APPROVED CATEGORIES: '+cats+'. Use ONLY these exact names.\n\n'
-      +'Be concise, friendly, and always use the provided expense data to answer queries.';
+      +'APPROVED CATEGORIES: '+cats+'. Use ONLY these exact names when logging expenses.\n\n'
+      +'DEDUCTIBLE FLAG:\n'
+      +'- Each expense in the data has a "deductible" field: true or false.\n'
+      +'- When asked about tax deductible expenses, ONLY list expenses where deductible === true.\n'
+      +'- NEVER infer deductibility from category names — use ONLY the deductible field in the data.\n'
+      +'- When displaying expense categories, use the EXACT category string from the data. Never modify or reformat it.\n\n'
+      +'Be concise, friendly, and always use the exact data provided to answer queries.';
   }
 
   function ocrprompt() {
@@ -528,6 +533,7 @@ async function sendMessage() {
         expenses:    A.expenses.map(e => ({
           date: e.date, vendor: e.vendor, amount: e.amount,
           tax: e.tax, category: e.category, notes: e.notes,
+          deductible: e.deductible || false,
         })),
       };
       const res = await Gemini.chat(text, A.hist.slice(-10), ctx);
